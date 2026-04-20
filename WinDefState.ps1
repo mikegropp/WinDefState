@@ -352,6 +352,55 @@ function Restore-LoadedUserRegistryValues {
     }
 }
 
+function Resolve-LocalUserTarget {
+    param([Parameter(Mandatory)] [object]$Reference)
+
+    $sidProperty = $Reference.PSObject.Properties['Sid']
+    if ($null -ne $sidProperty -and -not [string]::IsNullOrWhiteSpace([string]$sidProperty.Value)) {
+        try {
+            return Get-LocalUser -SID ([Security.Principal.SecurityIdentifier]$sidProperty.Value) -ErrorAction SilentlyContinue
+        } catch {
+        }
+    }
+
+    $ridProperty = $Reference.PSObject.Properties['Rid']
+    if ($null -ne $ridProperty -and $null -ne $ridProperty.Value) {
+        $ridSuffix = "-$([int]$ridProperty.Value)$"
+        $user = Get-LocalUser -ErrorAction SilentlyContinue |
+            Where-Object { $null -ne $_.SID -and $_.SID.Value -match $ridSuffix } |
+            Select-Object -First 1
+
+        if ($null -ne $user) {
+            return $user
+        }
+    }
+
+    $nameProperty = $Reference.PSObject.Properties['Name']
+    if ($null -ne $nameProperty -and -not [string]::IsNullOrWhiteSpace([string]$nameProperty.Value)) {
+        return Get-LocalUser -Name ([string]$nameProperty.Value) -ErrorAction SilentlyContinue
+    }
+
+    $null
+}
+
+function Set-LocalUserEnabledState {
+    param(
+        [Parameter(Mandatory)] [object]$Reference,
+        [Parameter(Mandatory)] [bool]$Enabled
+    )
+
+    $user = Resolve-LocalUserTarget -Reference $Reference
+    if ($null -eq $user -or $null -eq $user.SID) {
+        return
+    }
+
+    if ($Enabled) {
+        Enable-LocalUser -SID $user.SID -ErrorAction SilentlyContinue
+    } else {
+        Disable-LocalUser -SID $user.SID -ErrorAction SilentlyContinue
+    }
+}
+
 function Get-NetBiosAdapterStates {
     $adapters = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = TRUE' -ErrorAction SilentlyContinue
 
@@ -796,6 +845,7 @@ function Add-SnapshotEntryReportLines {
         }
         'LocalUser' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Name' -Value $Entry.Name
+            Add-ReportKeyValueLine -Lines $Lines -Label 'SID' -Value $Entry.Sid
             Add-ReportKeyValueLine -Lines $Lines -Label 'Enabled' -Value $Entry.CurrentValue
         }
         'WsManValue' {
@@ -1108,7 +1158,7 @@ function Get-DefenseDefinitions {
 
         [PSCustomObject]@{ Id = 'applocker.service'; Type = 'ServiceConfig'; Name = 'AppIDSvc'; PermissiveStartup = 'demand'; PermissiveState = 'Stopped'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'print.spooler_service'; Type = 'ServiceConfig'; Name = 'Spooler'; PermissiveStartup = 'auto'; PermissiveState = 'Running'; RequiresReboot = $false }
-        [PSCustomObject]@{ Id = 'localuser.administrator'; Type = 'LocalUser'; Name = 'Administrator'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'localuser.administrator'; Type = 'LocalUser'; Rid = 500; Name = 'Built-in local administrator'; PermissiveValue = $true; RequiresReboot = $false }
 
         [PSCustomObject]@{ Id = 'uac.prompt_on_secure_desktop'; Type = 'RegistryValue'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name = 'PromptOnSecureDesktop'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'uac.enable_lua'; Type = 'RegistryValue'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name = 'EnableLUA'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $true }
@@ -1260,11 +1310,13 @@ function Capture-Definition {
             }
         }
         'LocalUser' {
-            $user = Get-LocalUser -Name $Definition.Name -ErrorAction SilentlyContinue
+            $user = Resolve-LocalUserTarget -Reference $Definition
             return [PSCustomObject]@{
                 Id             = $Definition.Id
                 Type           = 'LocalUser'
-                Name           = $Definition.Name
+                Name           = if ($null -ne $user) { $user.Name } else { $Definition.Name }
+                Sid            = if ($null -ne $user -and $null -ne $user.SID) { $user.SID.Value } else { $null }
+                Rid            = if ($Definition.PSObject.Properties['Rid']) { $Definition.Rid } else { $null }
                 CurrentValue   = if ($null -ne $user) { $user.Enabled } else { $null }
                 RequiresReboot = $Definition.RequiresReboot
             }
@@ -1358,11 +1410,7 @@ function Apply-PermissiveDefinition {
             }
         }
         'LocalUser' {
-            if ($Definition.PermissiveValue) {
-                Enable-LocalUser -Name $Definition.Name -ErrorAction SilentlyContinue
-            } else {
-                Disable-LocalUser -Name $Definition.Name -ErrorAction SilentlyContinue
-            }
+            Set-LocalUserEnabledState -Reference $Definition -Enabled ([bool]$Definition.PermissiveValue)
         }
         'WsManValue' {
             Set-Item -Path $Definition.Path -Value $Definition.PermissiveValue
@@ -1436,11 +1484,7 @@ function Restore-SnapshotEntry {
                 return
             }
 
-            if ([bool]$Entry.CurrentValue) {
-                Enable-LocalUser -Name $Entry.Name -ErrorAction SilentlyContinue
-            } else {
-                Disable-LocalUser -Name $Entry.Name -ErrorAction SilentlyContinue
-            }
+            Set-LocalUserEnabledState -Reference $Entry -Enabled ([bool]$Entry.CurrentValue)
         }
         'WsManValue' {
             Set-Item -Path $Entry.Path -Value $Entry.CurrentValue
