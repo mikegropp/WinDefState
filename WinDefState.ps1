@@ -29,25 +29,43 @@ function Ensure-Directory {
     }
 }
 
+function Resolve-FileSystemPath {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $expandedPath = [Environment]::ExpandEnvironmentVariables($Path)
+
+    try {
+        [IO.Path]::GetFullPath($expandedPath)
+    } catch {
+        $expandedPath
+    }
+}
+
 function Write-JsonAtomic {
     param(
         [Parameter(Mandatory)] [string]$Path,
         [Parameter(Mandatory)] [object]$InputObject
     )
 
-    $parent = Split-Path -Parent $Path
+    $resolvedPath = Resolve-FileSystemPath -Path $Path
+    $parent = Split-Path -Parent $resolvedPath
     if (-not [string]::IsNullOrWhiteSpace($parent)) {
         Ensure-Directory -Path $parent
     }
 
-    $tempPath = "$Path.tmp"
+    $tempPath = Join-Path $parent ((Split-Path -Leaf $resolvedPath) + '.tmp')
     $json = $InputObject | ConvertTo-Json -Depth 12
     [System.IO.File]::WriteAllText($tempPath, $json, [System.Text.UTF8Encoding]::new($false))
 
-    if (Test-Path -LiteralPath $Path) {
-        [System.IO.File]::Replace($tempPath, $Path, $null)
+    if (Test-Path -LiteralPath $resolvedPath) {
+        try {
+            [System.IO.File]::Replace($tempPath, $resolvedPath, $null)
+        } catch {
+            Remove-Item -LiteralPath $resolvedPath -Force -ErrorAction SilentlyContinue
+            [System.IO.File]::Move($tempPath, $resolvedPath)
+        }
     } else {
-        [System.IO.File]::Move($tempPath, $Path)
+        [System.IO.File]::Move($tempPath, $resolvedPath)
     }
 }
 
@@ -57,18 +75,24 @@ function Write-TextAtomic {
         [Parameter(Mandatory)] [string]$Content
     )
 
-    $parent = Split-Path -Parent $Path
+    $resolvedPath = Resolve-FileSystemPath -Path $Path
+    $parent = Split-Path -Parent $resolvedPath
     if (-not [string]::IsNullOrWhiteSpace($parent)) {
         Ensure-Directory -Path $parent
     }
 
-    $tempPath = "$Path.tmp"
+    $tempPath = Join-Path $parent ((Split-Path -Leaf $resolvedPath) + '.tmp')
     [System.IO.File]::WriteAllText($tempPath, $Content, [System.Text.UTF8Encoding]::new($false))
 
-    if (Test-Path -LiteralPath $Path) {
-        [System.IO.File]::Replace($tempPath, $Path, $null)
+    if (Test-Path -LiteralPath $resolvedPath) {
+        try {
+            [System.IO.File]::Replace($tempPath, $resolvedPath, $null)
+        } catch {
+            Remove-Item -LiteralPath $resolvedPath -Force -ErrorAction SilentlyContinue
+            [System.IO.File]::Move($tempPath, $resolvedPath)
+        }
     } else {
-        [System.IO.File]::Move($tempPath, $Path)
+        [System.IO.File]::Move($tempPath, $resolvedPath)
     }
 }
 
