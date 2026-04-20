@@ -433,36 +433,60 @@ function ConvertTo-WsManTextValue {
     }
 }
 
-function Get-WsManCliTarget {
+function ConvertTo-WsManPolicyDword {
+    param([AllowNull()] [object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if ($Value -is [bool]) {
+        if ($Value) { return 1 } else { return 0 }
+    }
+
+    switch ([string]$Value) {
+        'True' { 1 }
+        'False' { 0 }
+        'true' { 1 }
+        'false' { 0 }
+        '1' { 1 }
+        '0' { 0 }
+        default {
+            throw "Unsupported WSMan policy value: $Value"
+        }
+    }
+}
+
+function Get-WsManPolicyTarget {
     param([Parameter(Mandatory)] [string]$Path)
 
     switch ($Path) {
         'WSMan:\localhost\Service\AllowUnencrypted' {
             return [PSCustomObject]@{
-                Resource = 'winrm/config/service'
-                Key      = 'AllowUnencrypted'
+                RegistryPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
+                Name         = 'AllowUnencryptedTraffic'
             }
         }
         'WSMan:\localhost\Client\AllowUnencrypted' {
             return [PSCustomObject]@{
-                Resource = 'winrm/config/client'
-                Key      = 'AllowUnencrypted'
+                RegistryPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client'
+                Name         = 'AllowUnencryptedTraffic'
             }
         }
         'WSMan:\localhost\Service\Auth\Basic' {
             return [PSCustomObject]@{
-                Resource = 'winrm/config/service/auth'
-                Key      = 'Basic'
+                RegistryPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
+                Name         = 'AllowBasic'
             }
         }
         'WSMan:\localhost\Client\Auth\Basic' {
             return [PSCustomObject]@{
-                Resource = 'winrm/config/client/auth'
-                Key      = 'Basic'
+                RegistryPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client'
+                Name         = 'AllowBasic'
             }
         }
         default {
-            throw "Unsupported WSMan path for CLI fallback: $Path"
+            throw "Unsupported WSMan path for policy write: $Path"
         }
     }
 }
@@ -473,11 +497,17 @@ function Set-WsManConfigValue {
         [AllowNull()] [object]$Value
     )
 
-    $target = Get-WsManCliTarget -Path $Path
-    $valueText = ConvertTo-WsManTextValue -Value $Value
-    $argument = '@{{{0}="{1}"}}' -f $target.Key, $valueText
+    $target = Get-WsManPolicyTarget -Path $Path
+    $registryValue = ConvertTo-WsManPolicyDword -Value $Value
 
-    & winrm set $target.Resource $argument | Out-Null
+    Ensure-RegistryPath -Path $target.RegistryPath
+
+    if ($null -eq $registryValue) {
+        Remove-ItemProperty -Path $target.RegistryPath -Name $target.Name -ErrorAction SilentlyContinue
+        return
+    }
+
+    New-ItemProperty -Path $target.RegistryPath -Name $target.Name -PropertyType DWord -Value $registryValue -Force | Out-Null
 }
 
 function Get-NetBiosAdapterStates {
