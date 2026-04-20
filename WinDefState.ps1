@@ -426,9 +426,9 @@ function ConvertTo-WsManTextValue {
         return $Value.ToString().ToLowerInvariant()
     }
 
-    switch ([string]$Value) {
-        'True' { 'true' }
-        'False' { 'false' }
+    switch -Exact (([string]$Value).ToLowerInvariant()) {
+        'true' { 'true' }
+        'false' { 'false' }
         default { [string]$Value }
     }
 }
@@ -444,11 +444,9 @@ function ConvertTo-WsManPolicyDword {
         if ($Value) { return 1 } else { return 0 }
     }
 
-    switch ([string]$Value) {
-        'True' { 1 }
-        'False' { 0 }
-        'true' { 1 }
-        'false' { 0 }
+    switch -Exact (([string]$Value).ToLowerInvariant()) {
+        'true' { return 1 }
+        'false' { return 0 }
         '1' { 1 }
         '0' { 0 }
         default {
