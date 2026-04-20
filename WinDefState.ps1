@@ -836,7 +836,7 @@ function Get-SnapshotReportLines {
     $lines.Add(('Reboot-required settings: {0}' -f (@($settings | Where-Object { $_.RequiresReboot }).Count)))
 
     foreach ($entry in $settings) {
-        $lines.Add('')
+        $lines.Add(' ')
         Add-SnapshotEntryReportLines -Lines $lines -Entry $entry
     }
 
@@ -844,7 +844,7 @@ function Get-SnapshotReportLines {
 }
 
 function Show-ReportLines {
-    param([Parameter(Mandatory)] [string[]]$Lines)
+    param([AllowEmptyString()] [string[]]$Lines)
 
     foreach ($line in @($Lines)) {
         Write-Host $line
@@ -1062,13 +1062,13 @@ function Get-VerificationReportLines {
     $lines.Add(('Mismatched settings: {0}' -f $Verification.MismatchCount))
 
     if ($mismatches.Count -eq 0) {
-        $lines.Add('')
+        $lines.Add(' ')
         $lines.Add('All captured settings match the requested snapshot.')
         return [string[]]$lines
     }
 
     foreach ($mismatch in $mismatches) {
-        $lines.Add('')
+        $lines.Add(' ')
         $lines.Add("[$($mismatch.Id)] $($mismatch.Type)")
         Add-ReportKeyValueLine -Lines $lines -Label 'Requires reboot' -Value $mismatch.RequiresReboot
         if (-not [string]::IsNullOrWhiteSpace([string]$mismatch.Reason)) {
