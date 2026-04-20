@@ -58,15 +58,10 @@ function Write-JsonAtomic {
     [System.IO.File]::WriteAllText($tempPath, $json, [System.Text.UTF8Encoding]::new($false))
 
     if (Test-Path -LiteralPath $resolvedPath) {
-        try {
-            [System.IO.File]::Replace($tempPath, $resolvedPath, $null)
-        } catch {
-            Remove-Item -LiteralPath $resolvedPath -Force -ErrorAction SilentlyContinue
-            [System.IO.File]::Move($tempPath, $resolvedPath)
-        }
-    } else {
-        [System.IO.File]::Move($tempPath, $resolvedPath)
+        Remove-Item -LiteralPath $resolvedPath -Force -ErrorAction SilentlyContinue
     }
+
+    Move-Item -LiteralPath $tempPath -Destination $resolvedPath -Force
 }
 
 function Write-TextAtomic {
@@ -85,15 +80,10 @@ function Write-TextAtomic {
     [System.IO.File]::WriteAllText($tempPath, $Content, [System.Text.UTF8Encoding]::new($false))
 
     if (Test-Path -LiteralPath $resolvedPath) {
-        try {
-            [System.IO.File]::Replace($tempPath, $resolvedPath, $null)
-        } catch {
-            Remove-Item -LiteralPath $resolvedPath -Force -ErrorAction SilentlyContinue
-            [System.IO.File]::Move($tempPath, $resolvedPath)
-        }
-    } else {
-        [System.IO.File]::Move($tempPath, $resolvedPath)
+        Remove-Item -LiteralPath $resolvedPath -Force -ErrorAction SilentlyContinue
     }
+
+    Move-Item -LiteralPath $tempPath -Destination $resolvedPath -Force
 }
 
 function Read-JsonFile {
