@@ -636,6 +636,25 @@ function Convert-ServiceStartModeToScValue {
     }
 }
 
+function ConvertTo-FirewallProfileEnabledValue {
+    param([AllowNull()] [object]$Value)
+
+    switch ([string]$Value) {
+        'True' { 'True' }
+        'False' { 'False' }
+        'NotConfigured' { 'NotConfigured' }
+        '1' { 'True' }
+        '0' { 'False' }
+        default {
+            if ($Value -is [bool]) {
+                if ($Value) { 'True' } else { 'False' }
+            } else {
+                [string]$Value
+            }
+        }
+    }
+}
+
 function ConvertTo-CanonicalValue {
     param([AllowNull()] [object]$Value)
 
@@ -1386,7 +1405,7 @@ function Apply-PermissiveDefinition {
             Set-Permissive-PowerShellModuleLogging
         }
         'FirewallProfiles' {
-            Set-NetFirewallProfile -Profile $Definition.Profiles -Enabled $Definition.PermissiveValue
+            Set-NetFirewallProfile -Profile $Definition.Profiles -Enabled (ConvertTo-FirewallProfileEnabledValue -Value $Definition.PermissiveValue)
         }
         'NetBiosAdapters' {
             Set-Permissive-NetBiosAdapters
@@ -1453,7 +1472,7 @@ function Restore-SnapshotEntry {
         }
         'FirewallProfiles' {
             foreach ($profile in @($Entry.CurrentValue)) {
-                Set-NetFirewallProfile -Profile $profile.Profile -Enabled ([bool]$profile.Enabled)
+                Set-NetFirewallProfile -Profile $profile.Profile -Enabled (ConvertTo-FirewallProfileEnabledValue -Value $profile.Enabled)
             }
         }
         'NetBiosAdapters' {
