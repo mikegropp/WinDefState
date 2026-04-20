@@ -57,9 +57,3 @@ You can also restore from a specific snapshot file:
 - Restore reads from the saved JSON snapshot on disk
 - `current-operation.json` records which snapshot should be used if the system loses power during testing
 - Reboot-required settings are still captured and restored, but some changes do not fully take effect until reboot
-
-## Next improvements
-
-- Split output into immediate changes and reboot-pending changes
-- Add `Test-DefenseDrift` to compare live state to a saved snapshot
-- Expand provider coverage where exact capture and exact restore are both supported
