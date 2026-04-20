@@ -5,9 +5,11 @@ WinDefState is a PowerShell tool for Windows defense testing. It snapshots the c
 ## What it does
 
 - Saves a disk-backed JSON snapshot before making changes
+- Writes a human-readable text report alongside each JSON snapshot
 - Writes a `current-operation.json` journal so restore still knows what to do after a crash or power loss
 - Applies a permissive profile for supported controls
 - Restores the original state from the saved snapshot, not from assumptions
+- Verifies the live system after restore and records a restore-check report
 
 ## Current coverage
 
@@ -42,7 +44,9 @@ WinDefState is a PowerShell tool for Windows defense testing. It snapshots the c
 ## Files on disk
 
 - Snapshots: `.\state\snapshots\HOST-YYYYMMDD-HHMMSS.json`
+- Snapshot reports: `.\state\snapshots\HOST-YYYYMMDD-HHMMSS.txt`
 - Active run journal: `.\state\current-operation.json`
+- Restore verification reports: `.\state\verification\HOST-YYYYMMDD-HHMMSS-restore-check-YYYYMMDD-HHMMSS.txt`
 
 ## Usage
 
@@ -54,6 +58,8 @@ Run from an elevated PowerShell session.
 .\WinDefState.ps1 -Command Restore
 ```
 
+`Snapshot` prints the human-readable report to the console and saves the same report to disk next to the JSON snapshot.
+
 You can also restore from a specific snapshot file:
 
 ```powershell
@@ -63,13 +69,15 @@ You can also restore from a specific snapshot file:
 ## Safety model
 
 - Snapshot is written to disk before permissive changes begin
+- A human-readable snapshot report is written to disk with the JSON snapshot
 - Restore reads from the saved JSON snapshot on disk
 - `current-operation.json` records which snapshot should be used if the system loses power during testing
+- Restore writes a verification report and only clears `current-operation.json` after the live state matches the target snapshot
 - Reboot-required settings are still captured and restored, but some changes do not fully take effect until reboot
 - Some user-scoped settings, such as Office macro policy and WPAD auto-detect, are currently captured from loaded user hives
 
 ## Next improvements
 
 - Split output into immediate changes and reboot-pending changes
-- Add `Test-DefenseDrift` to compare live state to a saved snapshot
+- Expose the restore verification logic as a standalone `Test-DefenseDrift` command
 - Expand provider coverage where exact capture and exact restore are both supported

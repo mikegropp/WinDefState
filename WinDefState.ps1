@@ -51,6 +51,27 @@ function Write-JsonAtomic {
     }
 }
 
+function Write-TextAtomic {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [string]$Content
+    )
+
+    $parent = Split-Path -Parent $Path
+    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+        Ensure-Directory -Path $parent
+    }
+
+    $tempPath = "$Path.tmp"
+    [System.IO.File]::WriteAllText($tempPath, $Content, [System.Text.UTF8Encoding]::new($false))
+
+    if (Test-Path -LiteralPath $Path) {
+        [System.IO.File]::Replace($tempPath, $Path, $null)
+    } else {
+        [System.IO.File]::Move($tempPath, $Path)
+    }
+}
+
 function Read-JsonFile {
     param([Parameter(Mandatory)] [string]$Path)
 
@@ -63,6 +84,25 @@ function Get-DefaultSnapshotPath {
     $snapshotDir = Join-Path $Root 'snapshots'
     Ensure-Directory -Path $snapshotDir
     Join-Path $snapshotDir "$($env:COMPUTERNAME)-$(Get-Date -Format 'yyyyMMdd-HHmmss').json"
+}
+
+function Get-SnapshotReportPath {
+    param([Parameter(Mandatory)] [string]$SnapshotPath)
+
+    [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($SnapshotPath), 'txt')
+}
+
+function Get-VerificationReportPath {
+    param(
+        [Parameter(Mandatory)] [string]$Root,
+        [Parameter(Mandatory)] [string]$SnapshotPath
+    )
+
+    $verificationDir = Join-Path $Root 'verification'
+    Ensure-Directory -Path $verificationDir
+
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($SnapshotPath)
+    Join-Path $verificationDir "$baseName-restore-check-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
 }
 
 function Get-OperationPath {
@@ -547,6 +587,500 @@ function Convert-ServiceStartModeToScValue {
     }
 }
 
+function ConvertTo-CanonicalValue {
+    param([AllowNull()] [object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if (
+        $Value -is [string] -or
+        $Value -is [char] -or
+        $Value -is [bool] -or
+        $Value -is [byte] -or
+        $Value -is [sbyte] -or
+        $Value -is [int16] -or
+        $Value -is [uint16] -or
+        $Value -is [int32] -or
+        $Value -is [uint32] -or
+        $Value -is [int64] -or
+        $Value -is [uint64] -or
+        $Value -is [single] -or
+        $Value -is [double] -or
+        $Value -is [decimal]
+    ) {
+        return $Value
+    }
+
+    if ($Value -is [datetime] -or $Value -is [guid] -or $Value -is [version]) {
+        return [string]$Value
+    }
+
+    if ($Value -is [System.Collections.IDictionary]) {
+        $ordered = [ordered]@{}
+        foreach ($key in @($Value.Keys | ForEach-Object { [string]$_ } | Sort-Object)) {
+            $ordered[$key] = ConvertTo-CanonicalValue -Value $Value[$key]
+        }
+
+        return [PSCustomObject]$ordered
+    }
+
+    if ($Value -is [System.Collections.IEnumerable] -and -not ($Value -is [string])) {
+        $items = @(
+            foreach ($item in @($Value)) {
+                ConvertTo-CanonicalValue -Value $item
+            }
+        )
+
+        $sortedItems = @(
+            foreach ($item in $items) {
+                [PSCustomObject]@{
+                    SortKey = ConvertTo-Json -InputObject $item -Depth 12 -Compress
+                    Value   = $item
+                }
+            }
+        ) | Sort-Object -Property SortKey
+
+        return @($sortedItems | ForEach-Object { $_.Value })
+    }
+
+    $properties = @($Value.PSObject.Properties | Where-Object { $_.MemberType -match 'Property' } | Sort-Object -Property Name)
+    if ($properties.Count -eq 0) {
+        return [string]$Value
+    }
+
+    $ordered = [ordered]@{}
+    foreach ($property in $properties) {
+        $ordered[$property.Name] = ConvertTo-CanonicalValue -Value $property.Value
+    }
+
+    [PSCustomObject]$ordered
+}
+
+function Get-CanonicalJson {
+    param([AllowNull()] [object]$Value)
+
+    ConvertTo-Json -InputObject (ConvertTo-CanonicalValue -Value $Value) -Depth 12 -Compress
+}
+
+function ConvertTo-DisplayString {
+    param([AllowNull()] [object]$Value)
+
+    if ($null -eq $Value) {
+        return '<null>'
+    }
+
+    if ($Value -is [bool]) {
+        return $Value.ToString()
+    }
+
+    if (
+        $Value -is [string] -or
+        $Value -is [char] -or
+        $Value -is [byte] -or
+        $Value -is [sbyte] -or
+        $Value -is [int16] -or
+        $Value -is [uint16] -or
+        $Value -is [int32] -or
+        $Value -is [uint32] -or
+        $Value -is [int64] -or
+        $Value -is [uint64] -or
+        $Value -is [single] -or
+        $Value -is [double] -or
+        $Value -is [decimal]
+    ) {
+        return [string]$Value
+    }
+
+    ConvertTo-Json -InputObject (ConvertTo-CanonicalValue -Value $Value) -Depth 12 -Compress
+}
+
+function Add-ReportKeyValueLine {
+    param(
+        [Parameter(Mandatory)] [System.Collections.Generic.List[string]]$Lines,
+        [Parameter(Mandatory)] [string]$Label,
+        [AllowNull()] [object]$Value,
+        [int]$Indent = 2
+    )
+
+    $Lines.Add(('{0}{1}: {2}' -f (' ' * $Indent), $Label, (ConvertTo-DisplayString -Value $Value)))
+}
+
+function Add-ReportJsonBlock {
+    param(
+        [Parameter(Mandatory)] [System.Collections.Generic.List[string]]$Lines,
+        [Parameter(Mandatory)] [string]$Label,
+        [AllowNull()] [object]$Value,
+        [int]$Indent = 2
+    )
+
+    $Lines.Add(('{0}{1}:' -f (' ' * $Indent), $Label))
+
+    $json = if ($null -eq $Value) {
+        'null'
+    } else {
+        ConvertTo-Json -InputObject (ConvertTo-CanonicalValue -Value $Value) -Depth 12
+    }
+
+    foreach ($line in @($json -split "`r?`n")) {
+        $Lines.Add(('{0}{1}' -f (' ' * ($Indent + 2)), $line))
+    }
+}
+
+function Add-SnapshotEntryReportLines {
+    param(
+        [Parameter(Mandatory)] [System.Collections.Generic.List[string]]$Lines,
+        [Parameter(Mandatory)] [object]$Entry
+    )
+
+    $Lines.Add("[$($Entry.Id)] $($Entry.Type)")
+    Add-ReportKeyValueLine -Lines $Lines -Label 'Requires reboot' -Value $Entry.RequiresReboot
+
+    switch ($Entry.Type) {
+        'RegistryValue' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Path' -Value $Entry.Path
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Name' -Value $Entry.Name
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Exists' -Value $Entry.Exists
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Value kind' -Value $Entry.ValueKind
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Current value' -Value $Entry.CurrentValue
+        }
+        'RegistryKeyFlat' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Path' -Value $Entry.Path
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Exists' -Value $Entry.Exists
+            Add-ReportJsonBlock -Lines $Lines -Label 'Values' -Value @($Entry.CurrentValue)
+        }
+        'MpPreferenceValue' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Property' -Value $Entry.Property
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Current value' -Value $Entry.CurrentValue
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Restore value' -Value $Entry.RestoreValue
+        }
+        'AsrRules' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Configured rule count' -Value @($Entry.CurrentValue).Count
+            foreach ($rule in @($Entry.CurrentValue)) {
+                $Lines.Add(('  - {0} | {1} | {2}' -f $rule.Id, $rule.Name, $rule.ActionLabel))
+            }
+        }
+        'PowerShellModuleLogging' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Base path' -Value $Entry.BasePath
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Exists' -Value $Entry.Exists
+            Add-ReportJsonBlock -Lines $Lines -Label 'Base values' -Value @($Entry.CurrentValue.BaseValues)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Module names key exists' -Value $Entry.CurrentValue.ModuleNamesExists
+            Add-ReportJsonBlock -Lines $Lines -Label 'Module names values' -Value @($Entry.CurrentValue.ModuleNamesValues)
+        }
+        'FirewallProfiles' {
+            foreach ($profile in @($Entry.CurrentValue)) {
+                $Lines.Add(('  - {0}: {1}' -f $profile.Profile, $profile.Enabled))
+            }
+        }
+        'NetBiosAdapters' {
+            foreach ($adapter in @($Entry.CurrentValue)) {
+                $Lines.Add(('  - Index {0} | {1} | TcpipNetbiosOptions={2}' -f $adapter.Index, $adapter.Description, $adapter.TcpipNetbiosOptions))
+            }
+        }
+        'LoadedUserRegistryValues' {
+            foreach ($value in @($Entry.CurrentValue)) {
+                $displayValue = if ($value.Exists) { ConvertTo-DisplayString -Value $value.CurrentValue } else { '<absent>' }
+                $Lines.Add(('  - {0} | {1} | {2} | {3}' -f $value.Sid, $value.RelativePath, $value.Name, $displayValue))
+            }
+        }
+        'MachineEnvironmentValue' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Name' -Value $Entry.Name
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Exists' -Value $Entry.Exists
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Current value' -Value $Entry.CurrentValue
+        }
+        'ServiceConfig' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Name' -Value $Entry.Name
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Start mode' -Value $Entry.CurrentValue.StartMode
+            Add-ReportKeyValueLine -Lines $Lines -Label 'State' -Value $Entry.CurrentValue.State
+        }
+        'LocalUser' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Name' -Value $Entry.Name
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Enabled' -Value $Entry.CurrentValue
+        }
+        'WsManValue' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Path' -Value $Entry.Path
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Current value' -Value $Entry.CurrentValue
+        }
+        'AuditPolicy' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Subcategory' -Value $Entry.Subcategory
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Success' -Value $Entry.CurrentValue.Success
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Failure' -Value $Entry.CurrentValue.Failure
+        }
+        'SmbClientConfig' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Require security signature' -Value $Entry.CurrentValue
+        }
+        'SmbServerConfig' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Require security signature' -Value $Entry.CurrentValue
+        }
+        default {
+            Add-ReportJsonBlock -Lines $Lines -Label 'Current value' -Value $Entry.CurrentValue
+        }
+    }
+}
+
+function Get-SnapshotReportLines {
+    param(
+        [Parameter(Mandatory)] [object]$Snapshot,
+        [Parameter(Mandatory)] [string]$SnapshotPath
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $settings = @($Snapshot.Settings)
+
+    $lines.Add('WinDefState Snapshot Report')
+    $lines.Add(('Snapshot JSON: {0}' -f $SnapshotPath))
+    $lines.Add(('ComputerName: {0}' -f $Snapshot.ComputerName))
+    $lines.Add(('CapturedAtUtc: {0}' -f $Snapshot.CapturedAtUtc))
+    $lines.Add(('Settings captured: {0}' -f $settings.Count))
+    $lines.Add(('Reboot-required settings: {0}' -f (@($settings | Where-Object { $_.RequiresReboot }).Count)))
+
+    foreach ($entry in $settings) {
+        $lines.Add('')
+        Add-SnapshotEntryReportLines -Lines $lines -Entry $entry
+    }
+
+    [string[]]$lines
+}
+
+function Show-ReportLines {
+    param([Parameter(Mandatory)] [string[]]$Lines)
+
+    foreach ($line in @($Lines)) {
+        Write-Host $line
+    }
+}
+
+function ConvertTo-ComparableSnapshotEntry {
+    param([Parameter(Mandatory)] [object]$Entry)
+
+    switch ($Entry.Type) {
+        'RegistryKeyFlat' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                Path           = $Entry.Path
+                Exists         = $Entry.Exists
+                CurrentValue   = @(
+                    foreach ($value in @($Entry.CurrentValue)) {
+                        [PSCustomObject]@{
+                            Name      = $value.Name
+                            ValueKind = $value.ValueKind
+                            Value     = $value.Value
+                        }
+                    }
+                )
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'MpPreferenceValue' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                Property       = $Entry.Property
+                RestoreValue   = $Entry.RestoreValue
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'AsrRules' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = @(
+                    foreach ($rule in @($Entry.CurrentValue)) {
+                        [PSCustomObject]@{
+                            Id          = [string]$rule.Id
+                            ActionLabel = if ($null -ne $rule.PSObject.Properties['ActionLabel']) { [string]$rule.ActionLabel } else { Get-AsrActionLabel -Action $rule.Action }
+                        }
+                    }
+                )
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'PowerShellModuleLogging' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                BasePath       = $Entry.BasePath
+                Exists         = $Entry.Exists
+                CurrentValue   = [ordered]@{
+                    BaseValues        = @(
+                        foreach ($value in @($Entry.CurrentValue.BaseValues)) {
+                            [PSCustomObject]@{
+                                Name      = $value.Name
+                                ValueKind = $value.ValueKind
+                                Value     = $value.Value
+                            }
+                        }
+                    )
+                    ModuleNamesExists = $Entry.CurrentValue.ModuleNamesExists
+                    ModuleNamesValues = @(
+                        foreach ($value in @($Entry.CurrentValue.ModuleNamesValues)) {
+                            [PSCustomObject]@{
+                                Name      = $value.Name
+                                ValueKind = $value.ValueKind
+                                Value     = $value.Value
+                            }
+                        }
+                    )
+                }
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'FirewallProfiles' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = @(
+                    foreach ($profile in @($Entry.CurrentValue)) {
+                        [PSCustomObject]@{
+                            Profile = $profile.Profile
+                            Enabled = [bool]$profile.Enabled
+                        }
+                    }
+                )
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'NetBiosAdapters' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = @(
+                    foreach ($adapter in @($Entry.CurrentValue)) {
+                        [PSCustomObject]@{
+                            Index               = [int]$adapter.Index
+                            TcpipNetbiosOptions = [int]$adapter.TcpipNetbiosOptions
+                        }
+                    }
+                )
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'LoadedUserRegistryValues' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = @(
+                    foreach ($value in @($Entry.CurrentValue)) {
+                        [PSCustomObject]@{
+                            Sid          = $value.Sid
+                            RelativePath = $value.RelativePath
+                            Name         = $value.Name
+                            Exists       = $value.Exists
+                            CurrentValue = $value.CurrentValue
+                            ValueKind    = $value.ValueKind
+                        }
+                    }
+                )
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        default {
+            return ConvertTo-CanonicalValue -Value $Entry
+        }
+    }
+}
+
+function Test-DefenseSnapshot {
+    param([Parameter(Mandatory)] [object]$Snapshot)
+
+    $definitions = @{}
+    foreach ($definition in Get-DefenseDefinitions) {
+        $definitions[[string]$definition.Id] = $definition
+    }
+
+    $results = @()
+    foreach ($entry in @($Snapshot.Settings)) {
+        $entryId = [string]$entry.Id
+        $expectedComparable = ConvertTo-ComparableSnapshotEntry -Entry $entry
+
+        if (-not $definitions.ContainsKey($entryId)) {
+            $results += [PSCustomObject]@{
+                Id             = $entryId
+                Type           = $entry.Type
+                RequiresReboot = $entry.RequiresReboot
+                Matches        = $false
+                Reason         = 'This snapshot entry no longer has a matching definition in the current script.'
+                Expected       = $expectedComparable
+                Actual         = $null
+            }
+            continue
+        }
+
+        try {
+            $liveEntry = Capture-Definition -Definition $definitions[$entryId]
+            $actualComparable = ConvertTo-ComparableSnapshotEntry -Entry $liveEntry
+            $matches = (Get-CanonicalJson -Value $expectedComparable) -eq (Get-CanonicalJson -Value $actualComparable)
+
+            $results += [PSCustomObject]@{
+                Id             = $entryId
+                Type           = $entry.Type
+                RequiresReboot = $entry.RequiresReboot
+                Matches        = $matches
+                Reason         = if ($matches) { $null } else { 'Live state does not match the snapshot entry.' }
+                Expected       = $expectedComparable
+                Actual         = $actualComparable
+            }
+        } catch {
+            $results += [PSCustomObject]@{
+                Id             = $entryId
+                Type           = $entry.Type
+                RequiresReboot = $entry.RequiresReboot
+                Matches        = $false
+                Reason         = $_.Exception.Message
+                Expected       = $expectedComparable
+                Actual         = $null
+            }
+        }
+    }
+
+    [PSCustomObject]@{
+        Tool          = 'WinDefState'
+        ComputerName  = $env:COMPUTERNAME
+        VerifiedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        MatchedCount  = @($results | Where-Object { $_.Matches }).Count
+        MismatchCount = @($results | Where-Object { -not $_.Matches }).Count
+        Results       = @($results)
+    }
+}
+
+function Get-VerificationReportLines {
+    param(
+        [Parameter(Mandatory)] [object]$Verification,
+        [Parameter(Mandatory)] [string]$SnapshotPath
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $mismatches = @($Verification.Results | Where-Object { -not $_.Matches })
+
+    $lines.Add('WinDefState Restore Verification')
+    $lines.Add(('Snapshot JSON: {0}' -f $SnapshotPath))
+    $lines.Add(('ComputerName: {0}' -f $Verification.ComputerName))
+    $lines.Add(('VerifiedAtUtc: {0}' -f $Verification.VerifiedAtUtc))
+    $lines.Add(('Matched settings: {0}' -f $Verification.MatchedCount))
+    $lines.Add(('Mismatched settings: {0}' -f $Verification.MismatchCount))
+
+    if ($mismatches.Count -eq 0) {
+        $lines.Add('')
+        $lines.Add('All captured settings match the requested snapshot.')
+        return [string[]]$lines
+    }
+
+    foreach ($mismatch in $mismatches) {
+        $lines.Add('')
+        $lines.Add("[$($mismatch.Id)] $($mismatch.Type)")
+        Add-ReportKeyValueLine -Lines $lines -Label 'Requires reboot' -Value $mismatch.RequiresReboot
+        if (-not [string]::IsNullOrWhiteSpace([string]$mismatch.Reason)) {
+            Add-ReportKeyValueLine -Lines $lines -Label 'Reason' -Value $mismatch.Reason
+        }
+        Add-ReportJsonBlock -Lines $lines -Label 'Expected' -Value $mismatch.Expected
+        Add-ReportJsonBlock -Lines $lines -Label 'Actual' -Value $mismatch.Actual
+    }
+
+    [string[]]$lines
+}
+
 function Get-DefenseDefinitions {
     $officeMacroApps = @('access', 'excel', 'powerpoint', 'project', 'publisher', 'visio', 'word')
     $officeMacroItems = foreach ($app in $officeMacroApps) {
@@ -926,6 +1460,7 @@ function Restore-SnapshotEntry {
 function Export-DefenseSnapshot {
     param([Parameter(Mandatory)] [string]$Path)
 
+    $fullPath = [IO.Path]::GetFullPath($Path)
     $snapshot = [PSCustomObject]@{
         SchemaVersion = 1
         Tool          = 'WinDefState'
@@ -934,8 +1469,18 @@ function Export-DefenseSnapshot {
         Settings      = @(foreach ($definition in Get-DefenseDefinitions) { Capture-Definition -Definition $definition })
     }
 
-    Write-JsonAtomic -Path $Path -InputObject $snapshot
-    [IO.Path]::GetFullPath($Path)
+    $reportPath = Get-SnapshotReportPath -SnapshotPath $fullPath
+    $reportLines = Get-SnapshotReportLines -Snapshot $snapshot -SnapshotPath $fullPath
+
+    Write-JsonAtomic -Path $fullPath -InputObject $snapshot
+    Write-TextAtomic -Path $reportPath -Content ($reportLines -join [Environment]::NewLine)
+
+    [PSCustomObject]@{
+        JsonPath    = $fullPath
+        ReportPath  = $reportPath
+        Snapshot    = $snapshot
+        ReportLines = @($reportLines)
+    }
 }
 
 function Set-DefensePermissive {
@@ -945,14 +1490,15 @@ function Set-DefensePermissive {
         $Path = Get-DefaultSnapshotPath -Root $StateRoot
     }
 
-    $fullPath = Export-DefenseSnapshot -Path $Path
-    Write-OperationState -Root $StateRoot -SnapshotPath $fullPath -Mode 'Permissive'
+    $export = Export-DefenseSnapshot -Path $Path
+    Write-OperationState -Root $StateRoot -SnapshotPath $export.JsonPath -Mode 'Permissive'
 
     foreach ($definition in Get-DefenseDefinitions) {
         Apply-PermissiveDefinition -Definition $definition
     }
 
-    Write-Host "Permissive mode applied. Snapshot saved to: $fullPath"
+    Write-Host "Permissive mode applied. Snapshot JSON saved to: $($export.JsonPath)"
+    Write-Host "Snapshot report saved to: $($export.ReportPath)"
 }
 
 function Restore-DefenseSnapshot {
@@ -967,13 +1513,28 @@ function Restore-DefenseSnapshot {
         $Path = [string]$operation.SnapshotPath
     }
 
-    $snapshot = Read-JsonFile -Path $Path
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $snapshot = Read-JsonFile -Path $fullPath
     foreach ($entry in @($snapshot.Settings)) {
         Restore-SnapshotEntry -Entry $entry
     }
 
+    $verification = Test-DefenseSnapshot -Snapshot $snapshot
+    $verificationPath = Get-VerificationReportPath -Root $StateRoot -SnapshotPath $fullPath
+    $verificationLines = Get-VerificationReportLines -Verification $verification -SnapshotPath $fullPath
+    Write-TextAtomic -Path $verificationPath -Content ($verificationLines -join [Environment]::NewLine)
+
+    if ($verification.MismatchCount -gt 0) {
+        $mismatchIds = @($verification.Results | Where-Object { -not $_.Matches } | ForEach-Object { $_.Id })
+        Write-Warning "Restore verification found $($verification.MismatchCount) mismatched setting(s)."
+        Write-Warning "Verification report saved to: $verificationPath"
+        Write-Warning ("Mismatched IDs: {0}" -f ($mismatchIds -join ', '))
+        throw 'Restore verification failed. current-operation.json was left in place so you can retry the same snapshot.'
+    }
+
     Clear-OperationState -Root $StateRoot
-    Write-Host "Restore completed from snapshot: $([IO.Path]::GetFullPath($Path))"
+    Write-Host "Restore completed and verified from snapshot: $fullPath"
+    Write-Host "Verification report saved to: $verificationPath"
 }
 
 Assert-Administrator
@@ -985,8 +1546,11 @@ switch ($Command) {
             $SnapshotPath = Get-DefaultSnapshotPath -Root $StateRoot
         }
 
-        $fullPath = Export-DefenseSnapshot -Path $SnapshotPath
-        Write-Host "Snapshot saved to: $fullPath"
+        $export = Export-DefenseSnapshot -Path $SnapshotPath
+        Write-Host "Snapshot JSON saved to: $($export.JsonPath)"
+        Write-Host "Snapshot report saved to: $($export.ReportPath)"
+        Write-Host ''
+        Show-ReportLines -Lines $export.ReportLines
     }
     'Permissive' {
         Set-DefensePermissive -Path $SnapshotPath
