@@ -415,6 +415,71 @@ function Set-LocalUserEnabledState {
     }
 }
 
+function ConvertTo-WsManTextValue {
+    param([AllowNull()] [object]$Value)
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    if ($Value -is [bool]) {
+        return $Value.ToString().ToLowerInvariant()
+    }
+
+    switch ([string]$Value) {
+        'True' { 'true' }
+        'False' { 'false' }
+        default { [string]$Value }
+    }
+}
+
+function Get-WsManCliTarget {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    switch ($Path) {
+        'WSMan:\localhost\Service\AllowUnencrypted' {
+            return [PSCustomObject]@{
+                Resource = 'winrm/config/service'
+                Key      = 'AllowUnencrypted'
+            }
+        }
+        'WSMan:\localhost\Client\AllowUnencrypted' {
+            return [PSCustomObject]@{
+                Resource = 'winrm/config/client'
+                Key      = 'AllowUnencrypted'
+            }
+        }
+        'WSMan:\localhost\Service\Auth\Basic' {
+            return [PSCustomObject]@{
+                Resource = 'winrm/config/service/auth'
+                Key      = 'Basic'
+            }
+        }
+        'WSMan:\localhost\Client\Auth\Basic' {
+            return [PSCustomObject]@{
+                Resource = 'winrm/config/client/auth'
+                Key      = 'Basic'
+            }
+        }
+        default {
+            throw "Unsupported WSMan path for CLI fallback: $Path"
+        }
+    }
+}
+
+function Set-WsManConfigValue {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [AllowNull()] [object]$Value
+    )
+
+    $target = Get-WsManCliTarget -Path $Path
+    $valueText = ConvertTo-WsManTextValue -Value $Value
+    $argument = '@{{{0}="{1}"}}' -f $target.Key, $valueText
+
+    & winrm set $target.Resource $argument | Out-Null
+}
+
 function Get-NetBiosAdapterStates {
     $adapters = Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = TRUE' -ErrorAction SilentlyContinue
 
@@ -1446,7 +1511,7 @@ function Apply-PermissiveDefinition {
             Set-LocalUserEnabledState -Reference $Definition -Enabled ([bool]$Definition.PermissiveValue)
         }
         'WsManValue' {
-            Set-Item -Path $Definition.Path -Value $Definition.PermissiveValue
+            Set-WsManConfigValue -Path $Definition.Path -Value $Definition.PermissiveValue
         }
         'AuditPolicy' {
             Set-AuditPolicyState -Subcategory $Definition.Subcategory -Success $Definition.PermissiveSuccess -Failure $Definition.PermissiveFailure
@@ -1520,7 +1585,7 @@ function Restore-SnapshotEntry {
             Set-LocalUserEnabledState -Reference $Entry -Enabled ([bool]$Entry.CurrentValue)
         }
         'WsManValue' {
-            Set-Item -Path $Entry.Path -Value $Entry.CurrentValue
+            Set-WsManConfigValue -Path $Entry.Path -Value $Entry.CurrentValue
         }
         'AuditPolicy' {
             Set-AuditPolicyState -Subcategory $Entry.Subcategory -Success ([bool]$Entry.CurrentValue.Success) -Failure ([bool]$Entry.CurrentValue.Failure)
