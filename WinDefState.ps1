@@ -1411,6 +1411,39 @@ function Normalize-ExploitProtectionXml {
         $document = New-Object System.Xml.XmlDocument
         $document.PreserveWhitespace = $false
         $document.LoadXml($Xml)
+
+        $mitigationPolicyNode = $document.SelectSingleNode('/MitigationPolicy')
+        $systemConfigNode = if ($null -ne $mitigationPolicyNode) { $mitigationPolicyNode.SelectSingleNode('SystemConfig') } else { $null }
+        if ($null -ne $systemConfigNode) {
+            $childElements = @($systemConfigNode.ChildNodes | Where-Object { $_ -is [System.Xml.XmlElement] })
+            if ($childElements.Count -eq 1 -and $childElements[0].Name -eq 'ASLR') {
+                $aslrNode = [System.Xml.XmlElement]$childElements[0]
+                $expectedAttributes = [ordered]@{
+                    ForceRelocateImages = 'false'
+                    RequireInfo         = 'false'
+                    BottomUp            = 'false'
+                    HighEntropy         = 'false'
+                }
+
+                $isDefaultNoOpSystemConfig = ($aslrNode.Attributes.Count -eq $expectedAttributes.Count)
+                if ($isDefaultNoOpSystemConfig) {
+                    foreach ($attributeName in $expectedAttributes.Keys) {
+                        if (
+                            -not $aslrNode.HasAttribute($attributeName) -or
+                            -not [string]::Equals($aslrNode.GetAttribute($attributeName), $expectedAttributes[$attributeName], [System.StringComparison]::OrdinalIgnoreCase)
+                        ) {
+                            $isDefaultNoOpSystemConfig = $false
+                            break
+                        }
+                    }
+                }
+
+                if ($isDefaultNoOpSystemConfig) {
+                    $null = $mitigationPolicyNode.RemoveChild($systemConfigNode)
+                }
+            }
+        }
+
         return $document.OuterXml
     } catch {
         return $Xml.Trim()
