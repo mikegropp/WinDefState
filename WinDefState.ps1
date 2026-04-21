@@ -2218,9 +2218,18 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Restore value' -Value $Entry.RestoreValue
         }
         'BitLockerVolumes' {
+            $timedOutMountPoints = @(Get-BitLockerTimedOutMountPoints -State $Entry.CurrentValue)
+            $capturedVolumes = @($Entry.CurrentValue.Volumes)
+
             Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value (Get-BitLockerCommandAvailableFlag -State $Entry.CurrentValue)
-            Add-ReportJsonBlock -Lines $Lines -Label 'Timed out mount points' -Value @(Get-BitLockerTimedOutMountPoints -State $Entry.CurrentValue)
-            foreach ($volume in @($Entry.CurrentValue.Volumes)) {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Timed out mount point count' -Value $timedOutMountPoints.Count
+            if ($timedOutMountPoints.Count -gt 0) {
+                foreach ($mountPoint in $timedOutMountPoints) {
+                    $Lines.Add(('  - Timed out mount point: {0}' -f $mountPoint))
+                }
+            }
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Captured volume count' -Value $capturedVolumes.Count
+            foreach ($volume in $capturedVolumes) {
                 $Lines.Add(('  - {0} | Protection={1} | Status={2} | Encryption={3}% | Protectors={4}' -f $volume.MountPoint, $volume.ProtectionStatus, $volume.VolumeStatus, $volume.EncryptionPercentage, $volume.KeyProtectorCount))
             }
         }
@@ -2259,8 +2268,14 @@ function Add-SnapshotEntryReportLines {
             }
             foreach ($rule in $invalidEntries) {
                 $displayId = if ([string]::IsNullOrWhiteSpace([string]$rule.Id)) { '<blank>' } else { [string]$rule.Id }
-                $displayAction = if ([string]::IsNullOrWhiteSpace([string]$rule.ActionLabel)) { '<blank>' } else { [string]$rule.ActionLabel }
-                $Lines.Add(('  - INVALID | {0} | {1}' -f $displayId, $displayAction))
+                $displayAction = if ([string]::IsNullOrWhiteSpace([string]$rule.Action)) {
+                    '<blank>'
+                } elseif ([string]::IsNullOrWhiteSpace([string]$rule.ActionLabel)) {
+                    [string]$rule.Action
+                } else {
+                    [string]$rule.ActionLabel
+                }
+                $Lines.Add(('  - Incomplete capture entry | RuleId={0} | Action={1}' -f $displayId, $displayAction))
             }
         }
         'PowerShellModuleLogging' {
