@@ -1669,6 +1669,22 @@ function Restore-WdacPolicyFiles {
     Write-WdacPolicyFiles -Files $Files -SnapshotPath $SnapshotPath
 }
 
+function Get-WdacCiToolStagingFileName {
+    param([Parameter(Mandatory)] [object]$File)
+
+    foreach ($candidate in @(
+        if ($File.PSObject.Properties['FileName']) { [string]$File.FileName },
+        if ($File.PSObject.Properties['RelativePath']) { Split-Path -Leaf ([string]$File.RelativePath) }
+    )) {
+        $safeName = [System.IO.Path]::GetFileName([string]$candidate)
+        if (-not [string]::IsNullOrWhiteSpace($safeName)) {
+            return $safeName
+        }
+    }
+
+    return ('{{{0}}}.cip' -f ([guid]::NewGuid().ToString().ToUpperInvariant()))
+}
+
 function Restore-WdacPolicies {
     param(
         [Parameter(Mandatory)] [object]$State,
@@ -1688,29 +1704,44 @@ function Restore-WdacPolicies {
 
     $ciTool = if ($State.CiToolAvailable) { Get-CiToolCommand } else { $null }
     if ($null -ne $ciTool) {
-        foreach ($file in $ciPolicyFiles) {
-            $tempPath = New-TemporaryFilePath -Extension '.cip'
-            try {
-                [System.IO.File]::WriteAllBytes($tempPath, (Get-WdacSnapshotFileBytes -File $file -SnapshotPath $SnapshotPath))
-                & $ciTool.Source -up $tempPath -json | Out-Null
-                if ($LASTEXITCODE -ne 0) {
-                    throw "CiTool failed to restore WDAC policy from $tempPath"
-                }
-            } finally {
-                if (Test-Path -LiteralPath $tempPath) {
-                    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("WinDefState-Wdac-{0}" -f ([guid]::NewGuid().ToString('N')))
+        Ensure-Directory -Path $stagingRoot
+        try {
+            foreach ($file in $ciPolicyFiles) {
+                $tempPath = Join-Path $stagingRoot (Get-WdacCiToolStagingFileName -File $file)
+                try {
+                    Write-Verbose ("Restoring WDAC policy via CiTool from staged file {0}" -f $tempPath)
+                    [System.IO.File]::WriteAllBytes($tempPath, (Get-WdacSnapshotFileBytes -File $file -SnapshotPath $SnapshotPath))
+                    $ciToolOutput = (& $ciTool.Source -up $tempPath -json 2>&1 | Out-String).Trim()
+                    if ($LASTEXITCODE -ne 0) {
+                        $message = "CiTool failed to restore WDAC policy from $tempPath (exit code $LASTEXITCODE)"
+                        if (-not [string]::IsNullOrWhiteSpace($ciToolOutput)) {
+                            $message = "$message. Output: $ciToolOutput"
+                        }
+
+                        throw $message
+                    }
+                } finally {
+                    if (Test-Path -LiteralPath $tempPath) {
+                        Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                    }
                 }
             }
-        }
 
-        if ($ciPolicyFiles.Count -gt 0) {
-            & $ciTool.Source -r | Out-Null
-        }
+            if ($ciPolicyFiles.Count -gt 0) {
+                & $ciTool.Source -r | Out-Null
+            }
 
-        if ($singlePolicyFiles.Count -gt 0) {
-            Write-WdacPolicyFiles -Files @($singlePolicyFiles) -SnapshotPath $SnapshotPath
+            if ($singlePolicyFiles.Count -gt 0) {
+                Write-WdacPolicyFiles -Files @($singlePolicyFiles) -SnapshotPath $SnapshotPath
+            }
+
+            return
+        } finally {
+            if (Test-Path -LiteralPath $stagingRoot) {
+                Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction SilentlyContinue
+            }
         }
-        return
     }
 
     Restore-WdacPolicyFiles -Files $files -SnapshotPath $SnapshotPath
