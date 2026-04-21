@@ -150,6 +150,60 @@ function Get-CiToolCommand {
     $null
 }
 
+function Invoke-ChildPowerShell {
+    param(
+        [Parameter(Mandatory)] [string]$ScriptText,
+        [int]$TimeoutSeconds = 15
+    )
+
+    $powershellCommand = Get-Command -Name 'powershell.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $powershellCommand) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            TimedOut         = $false
+            ExitCode         = $null
+            StdOut           = ''
+            StdErr           = 'powershell.exe was not found.'
+        }
+    }
+
+    $encodedCommand = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($ScriptText))
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $powershellCommand.Source
+    $startInfo.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encodedCommand"
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    [void]$process.Start()
+
+    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+        try {
+            $process.Kill()
+        } catch {
+        }
+
+        return [PSCustomObject]@{
+            CommandAvailable = $true
+            TimedOut         = $true
+            ExitCode         = $null
+            StdOut           = ''
+            StdErr           = ''
+        }
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable = $true
+        TimedOut         = $false
+        ExitCode         = $process.ExitCode
+        StdOut           = $process.StandardOutput.ReadToEnd()
+        StdErr           = $process.StandardError.ReadToEnd()
+    }
+}
+
 function Read-JsonFile {
     param([Parameter(Mandatory)] [string]$Path)
 
@@ -837,8 +891,9 @@ function Test-BitLockerProtectionEnabled {
 function Get-BitLockerVolumeStates {
     if (-not (Test-CommandAvailable -Name 'Get-BitLockerVolume')) {
         return [PSCustomObject]@{
-            CommandAvailable = $false
-            Volumes          = @()
+            CommandAvailable   = $false
+            TimedOutMountPoints = @()
+            Volumes            = @()
         }
     }
 
@@ -849,15 +904,54 @@ function Get-BitLockerVolumeStates {
             Sort-Object -Unique
     )
 
+    $timedOutMountPoints = [System.Collections.Generic.List[string]]::new()
     $states = foreach ($mountPoint in $mountPoints) {
         Write-Verbose ("BitLocker snapshot mount point {0}" -f $mountPoint)
-        $volume = Get-BitLockerVolume -MountPoint $mountPoint -ErrorAction SilentlyContinue
-        if ($null -eq $volume) {
+        $escapedMountPoint = $mountPoint.Replace("'", "''")
+        $result = Invoke-ChildPowerShell -TimeoutSeconds 12 -ScriptText @"
+$ErrorActionPreference = 'Stop'
+$volume = Get-BitLockerVolume -MountPoint '$escapedMountPoint' -ErrorAction SilentlyContinue
+if (`$null -eq `$volume) {
+    return
+}
+
+[PSCustomObject]@{
+    MountPoint           = [string]`$volume.MountPoint
+    VolumeType           = [string]`$volume.VolumeType
+    ProtectionStatus     = [string]`$volume.ProtectionStatus
+    VolumeStatus         = [string]`$volume.VolumeStatus
+    EncryptionMethod     = [string]`$volume.EncryptionMethod
+    EncryptionPercentage = if (`$null -ne `$volume.EncryptionPercentage) { [int]`$volume.EncryptionPercentage } else { `$null }
+} | ConvertTo-Json -Compress -Depth 4
+"@
+
+        if ($result.TimedOut) {
+            $timedOutMountPoints.Add($mountPoint) | Out-Null
+            Write-Warning "BitLocker snapshot timed out on mount point $mountPoint. Skipping it."
+            continue
+        }
+
+        if ($result.ExitCode -ne 0) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$result.StdErr)) {
+                Write-Warning "BitLocker snapshot failed on mount point $mountPoint: $($result.StdErr.Trim())"
+            }
+            continue
+        }
+
+        $json = [string]$result.StdOut
+        if ([string]::IsNullOrWhiteSpace($json)) {
+            continue
+        }
+
+        try {
+            $volume = $json | ConvertFrom-Json -ErrorAction Stop
+        } catch {
+            Write-Warning "BitLocker snapshot returned unparsable output on mount point $mountPoint. Skipping it."
             continue
         }
 
         [PSCustomObject]@{
-            MountPoint           = $mountPoint
+            MountPoint           = [string]$volume.MountPoint
             VolumeType           = [string]$volume.VolumeType
             ProtectionStatus     = ConvertTo-BitLockerProtectionStatusLabel -Value $volume.ProtectionStatus
             VolumeStatus         = [string]$volume.VolumeStatus
@@ -869,8 +963,9 @@ function Get-BitLockerVolumeStates {
     }
 
     [PSCustomObject]@{
-        CommandAvailable = $true
-        Volumes          = @($states)
+        CommandAvailable    = $true
+        TimedOutMountPoints = @($timedOutMountPoints)
+        Volumes             = @($states)
     }
 }
 
@@ -1428,6 +1523,7 @@ function Add-SnapshotEntryReportLines {
         }
         'BitLockerVolumes' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $Entry.CurrentValue.CommandAvailable
+            Add-ReportJsonBlock -Lines $Lines -Label 'Timed out mount points' -Value @($Entry.CurrentValue.TimedOutMountPoints)
             foreach ($volume in @($Entry.CurrentValue.Volumes)) {
                 $Lines.Add(('  - {0} | Protection={1} | Status={2} | Encryption={3}% | Protectors={4}' -f $volume.MountPoint, $volume.ProtectionStatus, $volume.VolumeStatus, $volume.EncryptionPercentage, $volume.KeyProtectorCount))
             }
@@ -1587,8 +1683,13 @@ function ConvertTo-ComparableSnapshotEntry {
                 Id             = $Entry.Id
                 Type           = $Entry.Type
                 CurrentValue   = [ordered]@{
-                    CommandAvailable = $Entry.CurrentValue.CommandAvailable
-                    Volumes          = @(
+                    CommandAvailable    = $Entry.CurrentValue.CommandAvailable
+                    TimedOutMountPoints = @(
+                        foreach ($mountPoint in @($Entry.CurrentValue.TimedOutMountPoints)) {
+                            [string]$mountPoint
+                        }
+                    )
+                    Volumes             = @(
                         foreach ($volume in @($Entry.CurrentValue.Volumes)) {
                             [PSCustomObject]@{
                                 MountPoint           = [string]$volume.MountPoint
