@@ -79,6 +79,58 @@ function Write-JsonAtomic {
     Move-Item -LiteralPath $tempPath -Destination $resolvedPath -Force
 }
 
+function Write-SnapshotJsonAtomic {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [object]$Snapshot
+    )
+
+    $resolvedPath = Resolve-FileSystemPath -Path $Path
+    $parent = Split-Path -Parent $resolvedPath
+    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+        Ensure-Directory -Path $parent
+    }
+
+    $tempPath = Join-Path $parent ((Split-Path -Leaf $resolvedPath) + '.tmp')
+    $encoding = [System.Text.UTF8Encoding]::new($false)
+    $stream = [System.IO.File]::Open($tempPath, [System.IO.FileMode]::Create, [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+    $writer = New-Object System.IO.StreamWriter($stream, $encoding)
+
+    try {
+        $writer.WriteLine('{')
+        $writer.WriteLine(('  "SchemaVersion": {0},' -f (ConvertTo-Json -InputObject $Snapshot.SchemaVersion -Compress)))
+        $writer.WriteLine(('  "Tool": {0},' -f (ConvertTo-Json -InputObject $Snapshot.Tool -Compress)))
+        $writer.WriteLine(('  "ComputerName": {0},' -f (ConvertTo-Json -InputObject $Snapshot.ComputerName -Compress)))
+        $writer.WriteLine(('  "CapturedAtUtc": {0},' -f (ConvertTo-Json -InputObject $Snapshot.CapturedAtUtc -Compress)))
+        $writer.WriteLine('  "Settings": [')
+
+        $settings = @($Snapshot.Settings)
+        for ($i = 0; $i -lt $settings.Count; $i++) {
+            $entry = $settings[$i]
+            $entryId = if ($null -ne $entry -and $entry.PSObject.Properties['Id']) { [string]$entry.Id } else { "<entry-$i>" }
+            Write-Verbose ("[json {0}/{1}] Serializing {2}" -f ($i + 1), $settings.Count, $entryId)
+            $entryJson = ConvertTo-Json -InputObject $entry -Depth 12 -Compress
+            $suffix = if ($i -lt ($settings.Count - 1)) { ',' } else { '' }
+            $writer.WriteLine(('    {0}{1}' -f $entryJson, $suffix))
+        }
+
+        $writer.WriteLine('  ]')
+        $writer.WriteLine('}')
+    } finally {
+        if ($null -ne $writer) {
+            $writer.Dispose()
+        } elseif ($null -ne $stream) {
+            $stream.Dispose()
+        }
+    }
+
+    if (Test-Path -LiteralPath $resolvedPath) {
+        Remove-Item -LiteralPath $resolvedPath -Force -ErrorAction SilentlyContinue
+    }
+
+    Move-Item -LiteralPath $tempPath -Destination $resolvedPath -Force
+}
+
 function Write-TextAtomic {
     param(
         [Parameter(Mandatory)] [string]$Path,
@@ -2753,7 +2805,7 @@ function Export-DefenseSnapshot {
     $reportLines = Get-SnapshotReportLines -Snapshot $snapshot -SnapshotPath $fullPath
 
     Write-Verbose "[post/4] Writing snapshot JSON"
-    Write-JsonAtomic -Path $fullPath -InputObject $snapshot
+    Write-SnapshotJsonAtomic -Path $fullPath -Snapshot $snapshot
     Write-Verbose "[post/4] Writing snapshot report"
     Write-TextAtomic -Path $reportPath -Content ($reportLines -join [Environment]::NewLine)
 
