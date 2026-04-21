@@ -1009,6 +1009,54 @@ function Get-AsrRuleCaptureState {
     }
 }
 
+function Get-AsrInvalidEntriesFromEntry {
+    param([AllowNull()] [object]$Entry)
+
+    if ($null -eq $Entry) {
+        return @()
+    }
+
+    $invalidEntries = @()
+
+    if ($Entry.PSObject.Properties['InvalidEntries']) {
+        foreach ($rule in @($Entry.InvalidEntries)) {
+            if ($null -eq $rule) {
+                continue
+            }
+
+            $action = if ($rule.PSObject.Properties['Action']) { [string]$rule.Action } else { $null }
+            $actionLabel = if ($rule.PSObject.Properties['ActionLabel']) { [string]$rule.ActionLabel } else { Get-AsrActionLabel -Action $action }
+
+            $invalidEntries += [PSCustomObject]@{
+                Id          = if ($rule.PSObject.Properties['Id']) { [string]$rule.Id } else { $null }
+                Action      = $action
+                ActionLabel = $actionLabel
+            }
+        }
+    }
+
+    foreach ($rule in @($Entry.CurrentValue)) {
+        if ($null -eq $rule) {
+            continue
+        }
+
+        $id = if ($rule.PSObject.Properties['Id']) { [string]$rule.Id } else { $null }
+        if (Test-AsrRuleId -Id $id) {
+            continue
+        }
+
+        $action = if ($rule.PSObject.Properties['Action']) { [string]$rule.Action } else { $null }
+        $actionLabel = if ($rule.PSObject.Properties['ActionLabel']) { [string]$rule.ActionLabel } else { Get-AsrActionLabel -Action $action }
+        $invalidEntries += [PSCustomObject]@{
+            Id          = $id
+            Action      = $action
+            ActionLabel = $actionLabel
+        }
+    }
+
+    @($invalidEntries)
+}
+
 function Get-ConfiguredAsrRules {
     @((Get-AsrRuleCaptureState).Rules)
 }
@@ -1933,7 +1981,7 @@ function Add-SnapshotEntryReportLines {
         }
         'AsrRules' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Configured rule count' -Value @($Entry.CurrentValue).Count
-            $invalidEntries = if ($Entry.PSObject.Properties['InvalidEntries']) { @($Entry.InvalidEntries) } else { @() }
+            $invalidEntries = @(Get-AsrInvalidEntriesFromEntry -Entry $Entry)
             Add-ReportKeyValueLine -Lines $Lines -Label 'Invalid capture entry count' -Value $invalidEntries.Count
             foreach ($rule in @($Entry.CurrentValue)) {
                 $Lines.Add(('  - {0} | {1} | {2}' -f $rule.Id, $rule.Name, $rule.ActionLabel))
@@ -2143,7 +2191,7 @@ function ConvertTo-ComparableSnapshotEntry {
             })
         }
         'AsrRules' {
-            $invalidEntries = if ($Entry.PSObject.Properties['InvalidEntries']) { @($Entry.InvalidEntries) } else { @() }
+            $invalidEntries = @(Get-AsrInvalidEntriesFromEntry -Entry $Entry)
             return ConvertTo-CanonicalValue -Value ([ordered]@{
                 Id             = $Entry.Id
                 Type           = $Entry.Type
@@ -2291,7 +2339,7 @@ function Test-SnapshotEntryCapturedExactly {
             return (Test-ExploitProtectionPolicyCapturedExactly -State $Entry.CurrentValue -SnapshotPath $SnapshotPath)
         }
         'AsrRules' {
-            $invalidEntries = if ($Entry.PSObject.Properties['InvalidEntries']) { @($Entry.InvalidEntries) } else { @() }
+            $invalidEntries = @(Get-AsrInvalidEntriesFromEntry -Entry $Entry)
             return ($invalidEntries.Count -eq 0)
         }
         'SmbClientConfig' {
