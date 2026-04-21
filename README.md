@@ -89,7 +89,7 @@ You can also restore from a specific snapshot file:
 - BitLocker snapshot is bounded to mounted volumes and skips a mount point if the provider does not return in time
 - BitLocker permissive mode suspends protectors on currently protected mounted volumes and restore resumes them based on the captured protection state
 - Snapshot records incomplete captures, and permissive/restore skips any setting whose baseline could not be captured exactly
-- WDAC policy file payloads are stored as sidecar snapshot assets instead of inline Base64 in the main JSON snapshot
+- Large policy payloads such as WDAC policy files and exploit protection XML are stored as sidecar snapshot assets instead of inline in the main JSON snapshot
 - WDAC restore uses active OS Code Integrity policy files and `CiTool` when available; on older hosts a reboot can still be required before the live state fully matches the restored snapshot
 
 ## Next improvements

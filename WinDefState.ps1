@@ -1327,6 +1327,51 @@ function Normalize-ExploitProtectionXml {
     }
 }
 
+function Get-ExploitProtectionPolicyXml {
+    param(
+        [AllowNull()] [object]$State,
+        [string]$SnapshotPath
+    )
+
+    if ($null -eq $State) {
+        return ''
+    }
+
+    if ($State.PSObject.Properties['Xml'] -and -not [string]::IsNullOrWhiteSpace([string]$State.Xml)) {
+        return [string]$State.Xml
+    }
+
+    if (
+        $State.PSObject.Properties['SnapshotAssetRelativePath'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$State.SnapshotAssetRelativePath) -and
+        -not [string]::IsNullOrWhiteSpace($SnapshotPath)
+    ) {
+        $assetRoot = Get-SnapshotAssetRoot -SnapshotPath $SnapshotPath
+        $assetPath = Join-Path $assetRoot ([string]$State.SnapshotAssetRelativePath)
+        if (-not (Test-Path -LiteralPath $assetPath)) {
+            throw "Exploit protection snapshot asset is missing: $assetPath"
+        }
+
+        return Get-Content -LiteralPath $assetPath -Raw
+    }
+
+    ''
+}
+
+function Test-ExploitProtectionPolicyCapturedExactly {
+    param(
+        [AllowNull()] [object]$State,
+        [string]$SnapshotPath
+    )
+
+    $commandAvailable = if ($null -ne $State -and $State.PSObject.Properties['CommandAvailable']) { [bool]$State.CommandAvailable } else { $true }
+    return (
+        $null -ne $State -and
+        $commandAvailable -and
+        -not [string]::IsNullOrWhiteSpace((Get-ExploitProtectionPolicyXml -State $State -SnapshotPath $SnapshotPath))
+    )
+}
+
 function Apply-ExploitProtectionPolicyXml {
     param([AllowNull()] [string]$Xml)
 
@@ -1790,7 +1835,8 @@ function Add-ReportJsonBlock {
 function Add-SnapshotEntryReportLines {
     param(
         [Parameter(Mandatory)] [System.Collections.Generic.List[string]]$Lines,
-        [Parameter(Mandatory)] [object]$Entry
+        [Parameter(Mandatory)] [object]$Entry,
+        [string]$SnapshotPath
     )
 
     $Lines.Add("[$($Entry.Id)] $($Entry.Type)")
@@ -1823,7 +1869,7 @@ function Add-SnapshotEntryReportLines {
         }
         'ExploitProtectionPolicy' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $Entry.CurrentValue.CommandAvailable
-            Add-ReportKeyValueLine -Lines $Lines -Label 'XML captured' -Value (-not [string]::IsNullOrWhiteSpace([string]$Entry.CurrentValue.Xml))
+            Add-ReportKeyValueLine -Lines $Lines -Label 'XML captured' -Value (-not [string]::IsNullOrWhiteSpace((Get-ExploitProtectionPolicyXml -State $Entry.CurrentValue -SnapshotPath $SnapshotPath)))
         }
         'WdacPolicies' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'CiTool available' -Value $Entry.CurrentValue.CiToolAvailable
@@ -1932,7 +1978,7 @@ function Get-SnapshotReportLines {
 
     foreach ($entry in $settings) {
         $lines.Add(' ')
-        Add-SnapshotEntryReportLines -Lines $lines -Entry $entry
+        Add-SnapshotEntryReportLines -Lines $lines -Entry $entry -SnapshotPath $SnapshotPath
     }
 
     [string[]]$lines
@@ -1947,7 +1993,10 @@ function Show-ReportLines {
 }
 
 function ConvertTo-ComparableSnapshotEntry {
-    param([Parameter(Mandatory)] [object]$Entry)
+    param(
+        [Parameter(Mandatory)] [object]$Entry,
+        [string]$SnapshotPath
+    )
 
     switch ($Entry.Type) {
         'RegistryKeyFlat' {
@@ -2005,12 +2054,13 @@ function ConvertTo-ComparableSnapshotEntry {
             })
         }
         'ExploitProtectionPolicy' {
+            $xml = Get-ExploitProtectionPolicyXml -State $Entry.CurrentValue -SnapshotPath $SnapshotPath
             return ConvertTo-CanonicalValue -Value ([ordered]@{
                 Id             = $Entry.Id
                 Type           = $Entry.Type
                 CurrentValue   = [ordered]@{
                     CommandAvailable = $Entry.CurrentValue.CommandAvailable
-                    Xml              = Normalize-ExploitProtectionXml -Xml ([string]$Entry.CurrentValue.Xml)
+                    Xml              = Normalize-ExploitProtectionXml -Xml $xml
                 }
                 RequiresReboot = $Entry.RequiresReboot
             })
@@ -2170,19 +2220,17 @@ function ConvertTo-ComparableSnapshotEntry {
 }
 
 function Test-SnapshotEntryCapturedExactly {
-    param([Parameter(Mandatory)] [object]$Entry)
+    param(
+        [Parameter(Mandatory)] [object]$Entry,
+        [string]$SnapshotPath
+    )
 
     switch ($Entry.Type) {
         'BitLockerVolumes' {
             return (Test-BitLockerStateCapturedExactly -State $Entry.CurrentValue)
         }
         'ExploitProtectionPolicy' {
-            $commandAvailable = if ($null -ne $Entry.CurrentValue -and $Entry.CurrentValue.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CurrentValue.CommandAvailable } else { $true }
-            return (
-                $null -ne $Entry.CurrentValue -and
-                $commandAvailable -and
-                -not [string]::IsNullOrWhiteSpace([string]$Entry.CurrentValue.Xml)
-            )
+            return (Test-ExploitProtectionPolicyCapturedExactly -State $Entry.CurrentValue -SnapshotPath $SnapshotPath)
         }
         'SmbClientConfig' {
             $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
@@ -2199,7 +2247,10 @@ function Test-SnapshotEntryCapturedExactly {
 }
 
 function Test-DefenseSnapshot {
-    param([Parameter(Mandatory)] [object]$Snapshot)
+    param(
+        [Parameter(Mandatory)] [object]$Snapshot,
+        [string]$SnapshotPath
+    )
 
     $definitions = @{}
     foreach ($definition in Get-DefenseDefinitions) {
@@ -2209,7 +2260,7 @@ function Test-DefenseSnapshot {
     $results = @()
     foreach ($entry in @($Snapshot.Settings)) {
         $entryId = [string]$entry.Id
-        $expectedComparable = ConvertTo-ComparableSnapshotEntry -Entry $entry
+        $expectedComparable = ConvertTo-ComparableSnapshotEntry -Entry $entry -SnapshotPath $SnapshotPath
 
         if (-not $definitions.ContainsKey($entryId)) {
             $results += [PSCustomObject]@{
@@ -2306,6 +2357,21 @@ function Persist-SnapshotExternalAssets {
     $assetRoot = Get-SnapshotAssetRoot -SnapshotPath $SnapshotPath
 
     foreach ($entry in @($Snapshot.Settings)) {
+        if ([string]$entry.Type -eq 'ExploitProtectionPolicy' -and $null -ne $entry.CurrentValue) {
+            $xml = Get-ExploitProtectionPolicyXml -State $entry.CurrentValue
+            $assetRelativePath = Join-Path 'exploit-protection' 'policy.xml'
+            if (-not [string]::IsNullOrWhiteSpace($xml)) {
+                $assetPath = Join-Path $assetRoot $assetRelativePath
+                Write-TextAtomic -Path $assetPath -Content $xml
+            }
+
+            $entry.CurrentValue = [PSCustomObject]@{
+                CommandAvailable         = $entry.CurrentValue.CommandAvailable
+                SnapshotAssetRelativePath = if (-not [string]::IsNullOrWhiteSpace($xml)) { $assetRelativePath } else { $null }
+            }
+            continue
+        }
+
         if ([string]$entry.Type -ne 'WdacPolicies' -or $null -eq $entry.CurrentValue) {
             continue
         }
@@ -2685,7 +2751,7 @@ function Restore-SnapshotEntry {
         [string]$SnapshotPath
     )
 
-    if (-not (Test-SnapshotEntryCapturedExactly -Entry $Entry)) {
+    if (-not (Test-SnapshotEntryCapturedExactly -Entry $Entry -SnapshotPath $SnapshotPath)) {
         Write-Warning "Skipping restore for $($Entry.Id) because the snapshot baseline was incomplete."
         return
     }
@@ -2709,7 +2775,7 @@ function Restore-SnapshotEntry {
             Restore-BitLockerVolumes -State $Entry.CurrentValue
         }
         'ExploitProtectionPolicy' {
-            Apply-ExploitProtectionPolicyXml -Xml ([string]$Entry.CurrentValue.Xml)
+            Apply-ExploitProtectionPolicyXml -Xml (Get-ExploitProtectionPolicyXml -State $Entry.CurrentValue -SnapshotPath $SnapshotPath)
         }
         'WdacPolicies' {
             Restore-WdacPolicies -State $Entry.CurrentValue -SnapshotPath $SnapshotPath
@@ -2837,7 +2903,7 @@ function Set-DefensePermissive {
         $definition = $definitions[$i]
         Write-Verbose ("[{0}/{1}] Applying permissive setting {2}" -f ($i + 1), $definitions.Count, $definition.Id)
         $entry = if ($snapshotEntriesById.ContainsKey([string]$definition.Id)) { $snapshotEntriesById[[string]$definition.Id] } else { $null }
-        if ($null -ne $entry -and -not (Test-SnapshotEntryCapturedExactly -Entry $entry)) {
+        if ($null -ne $entry -and -not (Test-SnapshotEntryCapturedExactly -Entry $entry -SnapshotPath $export.JsonPath)) {
             Write-Warning "Skipping permissive change for $($definition.Id) because the baseline capture was incomplete."
             continue
         }
@@ -2870,7 +2936,7 @@ function Restore-DefenseSnapshot {
         Restore-SnapshotEntry -Entry $entry -SnapshotPath $fullPath
     }
 
-    $verification = Test-DefenseSnapshot -Snapshot $snapshot
+    $verification = Test-DefenseSnapshot -Snapshot $snapshot -SnapshotPath $fullPath
     $verificationPath = Get-VerificationReportPath -Root $StateRoot -SnapshotPath $fullPath
     $verificationLines = Get-VerificationReportLines -Verification $verification -SnapshotPath $fullPath
     Write-TextAtomic -Path $verificationPath -Content ($verificationLines -join [Environment]::NewLine)
