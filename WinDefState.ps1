@@ -1672,10 +1672,16 @@ function Restore-WdacPolicyFiles {
 function Get-WdacCiToolStagingFileName {
     param([Parameter(Mandatory)] [object]$File)
 
-    foreach ($candidate in @(
-        if ($File.PSObject.Properties['FileName']) { [string]$File.FileName },
-        if ($File.PSObject.Properties['RelativePath']) { Split-Path -Leaf ([string]$File.RelativePath) }
-    )) {
+    $candidates = @()
+    if ($File.PSObject.Properties['FileName']) {
+        $candidates += [string]$File.FileName
+    }
+
+    if ($File.PSObject.Properties['RelativePath']) {
+        $candidates += Split-Path -Leaf ([string]$File.RelativePath)
+    }
+
+    foreach ($candidate in $candidates) {
         $safeName = [System.IO.Path]::GetFileName([string]$candidate)
         if (-not [string]::IsNullOrWhiteSpace($safeName)) {
             return $safeName
