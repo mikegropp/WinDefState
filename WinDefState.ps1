@@ -2264,12 +2264,21 @@ function Export-DefenseSnapshot {
     param([Parameter(Mandatory)] [string]$Path)
 
     $fullPath = [IO.Path]::GetFullPath($Path)
+    $definitions = @(Get-DefenseDefinitions)
+    $settings = [System.Collections.Generic.List[object]]::new()
+
+    for ($i = 0; $i -lt $definitions.Count; $i++) {
+        $definition = $definitions[$i]
+        Write-Verbose ("[{0}/{1}] Capturing {2}" -f ($i + 1), $definitions.Count, $definition.Id)
+        $settings.Add((Capture-Definition -Definition $definition))
+    }
+
     $snapshot = [PSCustomObject]@{
         SchemaVersion = 1
         Tool          = 'WinDefState'
         ComputerName  = $env:COMPUTERNAME
         CapturedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-        Settings      = @(foreach ($definition in Get-DefenseDefinitions) { Capture-Definition -Definition $definition })
+        Settings      = @($settings)
     }
 
     $reportPath = Get-SnapshotReportPath -SnapshotPath $fullPath
@@ -2296,7 +2305,10 @@ function Set-DefensePermissive {
     $export = Export-DefenseSnapshot -Path $Path
     Write-OperationState -Root $StateRoot -SnapshotPath $export.JsonPath -Mode 'Permissive'
 
-    foreach ($definition in Get-DefenseDefinitions) {
+    $definitions = @(Get-DefenseDefinitions)
+    for ($i = 0; $i -lt $definitions.Count; $i++) {
+        $definition = $definitions[$i]
+        Write-Verbose ("[{0}/{1}] Applying permissive setting {2}" -f ($i + 1), $definitions.Count, $definition.Id)
         Apply-PermissiveDefinition -Definition $definition
     }
 
@@ -2318,7 +2330,10 @@ function Restore-DefenseSnapshot {
 
     $fullPath = [IO.Path]::GetFullPath($Path)
     $snapshot = Read-JsonFile -Path $fullPath
-    foreach ($entry in @($snapshot.Settings)) {
+    $entries = @($snapshot.Settings)
+    for ($i = 0; $i -lt $entries.Count; $i++) {
+        $entry = $entries[$i]
+        Write-Verbose ("[{0}/{1}] Restoring {2}" -f ($i + 1), $entries.Count, $entry.Id)
         Restore-SnapshotEntry -Entry $entry
     }
 
