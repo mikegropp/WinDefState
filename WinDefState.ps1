@@ -6,11 +6,26 @@ param(
 
     [string]$SnapshotPath,
 
-    [string]$StateRoot = (Join-Path $PSScriptRoot 'state')
+    [string]$StateRoot
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+$scriptRoot = $PSScriptRoot
+if ([string]::IsNullOrWhiteSpace($scriptRoot)) {
+    if (-not [string]::IsNullOrWhiteSpace($PSCommandPath)) {
+        $scriptRoot = Split-Path -Parent $PSCommandPath
+    } elseif ($null -ne $MyInvocation.MyCommand -and -not [string]::IsNullOrWhiteSpace([string]$MyInvocation.MyCommand.Path)) {
+        $scriptRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
+    } else {
+        $scriptRoot = (Get-Location).Path
+    }
+}
+
+if ([string]::IsNullOrWhiteSpace($StateRoot)) {
+    $StateRoot = Join-Path $scriptRoot 'state'
+}
 
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
