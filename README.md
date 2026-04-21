@@ -31,7 +31,7 @@ WinDefState is a PowerShell tool for Windows defense testing. It snapshots the c
 - PowerShell transcription
 - AppLocker service state
 - Print Spooler service state
-- Built-in Administrator account state, tracked by RID-500 SID even if renamed
+- Built-in Administrator account state
 - UAC-related registry settings
 - RDP NLA
 - RDP Restricted Admin mode
