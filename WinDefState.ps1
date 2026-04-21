@@ -1538,15 +1538,123 @@ function Get-WdacPolicyIdentifiers {
 
     @(
         foreach ($policy in @($Policies)) {
-            foreach ($name in @('PolicyID', 'PolicyId', 'PolicyGuid', 'PolicyGUID', 'Id', 'ID')) {
-                $property = $policy.PSObject.Properties[$name]
-                if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                    [string]$property.Value
-                    break
-                }
+            $policyId = Get-WdacPolicyIdentifierFromObject -Policy $policy
+            if (-not [string]::IsNullOrWhiteSpace($policyId)) {
+                $policyId
             }
         }
     ) | Sort-Object -Unique
+}
+
+function Get-WdacPolicyIdentifierFromObject {
+    param([Parameter(Mandatory)] [object]$Policy)
+
+    foreach ($name in @('PolicyID', 'PolicyId', 'PolicyGuid', 'PolicyGUID', 'Id', 'ID')) {
+        $property = $Policy.PSObject.Properties[$name]
+        if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+            return [string]$property.Value
+        }
+    }
+
+    return $null
+}
+
+function Get-WdacNormalizedPolicyId {
+    param([AllowNull()] [object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+
+    $text = $text.TrimStart('{').TrimEnd('}')
+    $guid = [guid]::Empty
+    if ([guid]::TryParse($text, [ref]$guid)) {
+        return $guid.ToString().ToLowerInvariant()
+    }
+
+    return $text.ToLowerInvariant()
+}
+
+function Get-WdacPolicyIdFromFileName {
+    param([AllowNull()] [string]$FileName)
+
+    if ([string]::IsNullOrWhiteSpace($FileName)) {
+        return $null
+    }
+
+    $leaf = [System.IO.Path]::GetFileName($FileName)
+    if ($leaf -match '^\{?([0-9A-Fa-f-]{36})\}?\.cip$') {
+        return Get-WdacNormalizedPolicyId -Value $matches[1]
+    }
+
+    return $null
+}
+
+function Test-WdacPolicyRemovalCandidate {
+    param([Parameter(Mandatory)] [object]$Policy)
+
+    $hasFileOnDisk = $null
+    if ($Policy.PSObject.Properties['HasFileOnDisk']) {
+        $hasFileOnDisk = ConvertTo-NullableBoolean -Value $Policy.HasFileOnDisk
+    }
+
+    $isEnforced = $null
+    foreach ($name in @('IsCurrentlyEnforced', 'IsEnforced')) {
+        if ($Policy.PSObject.Properties[$name]) {
+            $isEnforced = ConvertTo-NullableBoolean -Value $Policy.$name
+            if ($null -ne $isEnforced) {
+                break
+            }
+        }
+    }
+
+    return (($hasFileOnDisk -eq $true) -or ($isEnforced -eq $true))
+}
+
+function Test-WdacPolicyPresent {
+    param(
+        [Parameter(Mandatory)] [object]$State,
+        [AllowNull()] [string]$PolicyId
+    )
+
+    $normalizedTarget = Get-WdacNormalizedPolicyId -Value $PolicyId
+    if ([string]::IsNullOrWhiteSpace($normalizedTarget)) {
+        return $false
+    }
+
+    foreach ($policy in @($State.Policies)) {
+        $normalizedPolicyId = Get-WdacNormalizedPolicyId -Value (Get-WdacPolicyIdentifierFromObject -Policy $policy)
+        if (-not [string]::IsNullOrWhiteSpace($normalizedPolicyId) -and $normalizedPolicyId -eq $normalizedTarget) {
+            return $true
+        }
+    }
+
+    return $false
+}
+
+function Test-WdacSnapshotFileMatchesLiveFile {
+    param(
+        [Parameter(Mandatory)] [object]$File,
+        [string]$SnapshotPath
+    )
+
+    $destination = Join-Path (Get-WdacCodeIntegrityRoot) ([string]$File.RelativePath)
+    if (-not (Test-Path -LiteralPath $destination)) {
+        return $false
+    }
+
+    $expectedHash = if ($File.PSObject.Properties['Sha256']) { [string]$File.Sha256 } else { $null }
+    if ([string]::IsNullOrWhiteSpace($expectedHash)) {
+        $expectedHash = (Get-FileHash -InputStream ([System.IO.MemoryStream]::new((Get-WdacSnapshotFileBytes -File $File -SnapshotPath $SnapshotPath))) -Algorithm SHA256).Hash
+    }
+
+    $currentHash = (Get-FileHash -LiteralPath $destination -Algorithm SHA256).Hash
+    return [string]::Equals($expectedHash, $currentHash, [System.StringComparison]::OrdinalIgnoreCase)
 }
 
 function Get-WdacPolicyState {
@@ -1602,7 +1710,15 @@ function Remove-WdacPolicies {
     $removedWithCiTool = $false
     $ciTool = if ($State.CiToolAvailable) { Get-CiToolCommand } else { $null }
     if ($null -ne $ciTool) {
-        foreach ($policyId in @(Get-WdacPolicyIdentifiers -Policies @($State.Policies))) {
+        $policyIds = @(
+            foreach ($policy in @($State.Policies)) {
+                if (Test-WdacPolicyRemovalCandidate -Policy $policy) {
+                    Get-WdacPolicyIdentifierFromObject -Policy $policy
+                }
+            }
+        ) | Sort-Object -Unique
+
+        foreach ($policyId in @($policyIds)) {
             & $ciTool.Source -rp $policyId -json | Out-Null
             if ($LASTEXITCODE -eq 0) {
                 $removedWithCiTool = $true
@@ -1712,17 +1828,45 @@ function Restore-WdacPolicies {
     if ($null -ne $ciTool) {
         $stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("WinDefState-Wdac-{0}" -f ([guid]::NewGuid().ToString('N')))
         Ensure-Directory -Path $stagingRoot
+        $usedDirectFileFallback = $false
         try {
             foreach ($file in $ciPolicyFiles) {
+                $filePolicyId = Get-WdacPolicyIdFromFileName -FileName ([string]$file.FileName)
+                if (Test-WdacSnapshotFileMatchesLiveFile -File $file -SnapshotPath $SnapshotPath) {
+                    Write-Verbose ("WDAC policy file already matches snapshot on disk: {0}" -f ([string]$file.RelativePath))
+                    continue
+                }
+
                 $tempPath = Join-Path $stagingRoot (Get-WdacCiToolStagingFileName -File $file)
                 try {
                     Write-Verbose ("Restoring WDAC policy via CiTool from staged file {0}" -f $tempPath)
                     [System.IO.File]::WriteAllBytes($tempPath, (Get-WdacSnapshotFileBytes -File $file -SnapshotPath $SnapshotPath))
                     $ciToolOutput = (& $ciTool.Source -up $tempPath -json 2>&1 | Out-String).Trim()
                     if ($LASTEXITCODE -ne 0) {
+                        $ciToolExitCode = $LASTEXITCODE
                         $message = "CiTool failed to restore WDAC policy from $tempPath (exit code $LASTEXITCODE)"
                         if (-not [string]::IsNullOrWhiteSpace($ciToolOutput)) {
                             $message = "$message. Output: $ciToolOutput"
+                        }
+
+                        $postFailureState = Get-WdacPolicyState
+                        if (Test-WdacSnapshotFileMatchesLiveFile -File $file -SnapshotPath $SnapshotPath) {
+                            Write-Warning ("CiTool reported failure while restoring WDAC policy {0}, but the on-disk policy file already matches the snapshot. Continuing." -f ([string]$file.FileName))
+                            continue
+                        }
+
+                        if ((-not [string]::IsNullOrWhiteSpace($filePolicyId)) -and (Test-WdacPolicyPresent -State $postFailureState -PolicyId $filePolicyId)) {
+                            Write-Warning ("CiTool reported failure while restoring WDAC policy {0}, but the policy is already present in the live CiTool state. Continuing." -f $filePolicyId)
+                            continue
+                        }
+
+                        if ($ciToolExitCode -eq -2147024891) {
+                            Write-Warning ("CiTool access denied while restoring WDAC policy {0}. Falling back to direct file restore; a reboot may be required before live WDAC state fully matches the snapshot." -f ([string]$file.FileName))
+                            Write-WdacPolicyFiles -Files @($file) -SnapshotPath $SnapshotPath
+                            if (Test-WdacSnapshotFileMatchesLiveFile -File $file -SnapshotPath $SnapshotPath) {
+                                $usedDirectFileFallback = $true
+                                continue
+                            }
                         }
 
                         throw $message
@@ -1734,12 +1878,16 @@ function Restore-WdacPolicies {
                 }
             }
 
-            if ($ciPolicyFiles.Count -gt 0) {
+            if ($ciPolicyFiles.Count -gt 0 -and -not $usedDirectFileFallback) {
                 & $ciTool.Source -r | Out-Null
             }
 
             if ($singlePolicyFiles.Count -gt 0) {
                 Write-WdacPolicyFiles -Files @($singlePolicyFiles) -SnapshotPath $SnapshotPath
+            }
+
+            if ($usedDirectFileFallback) {
+                Write-Warning 'One or more WDAC policy files were restored directly to disk after CiTool access was denied. A reboot may be required before verification fully matches the snapshot.'
             }
 
             return
