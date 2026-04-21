@@ -224,6 +224,15 @@ function Get-SnapshotReportPath {
     [IO.Path]::ChangeExtension([IO.Path]::GetFullPath($SnapshotPath), 'txt')
 }
 
+function Get-SnapshotAssetRoot {
+    param([Parameter(Mandatory)] [string]$SnapshotPath)
+
+    $fullPath = [IO.Path]::GetFullPath($SnapshotPath)
+    $snapshotDir = Split-Path -Parent $fullPath
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($fullPath)
+    Join-Path $snapshotDir ($baseName + '.assets')
+}
+
 function Get-VerificationReportPath {
     param(
         [Parameter(Mandatory)] [string]$Root,
@@ -1423,25 +1432,61 @@ function Remove-WdacPolicies {
     }
 }
 
+function Get-WdacSnapshotFileBytes {
+    param(
+        [Parameter(Mandatory)] [object]$File,
+        [string]$SnapshotPath
+    )
+
+    if ($File.PSObject.Properties['Base64'] -and -not [string]::IsNullOrWhiteSpace([string]$File.Base64)) {
+        return [Convert]::FromBase64String([string]$File.Base64)
+    }
+
+    if (
+        $File.PSObject.Properties['SnapshotAssetRelativePath'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$File.SnapshotAssetRelativePath) -and
+        -not [string]::IsNullOrWhiteSpace($SnapshotPath)
+    ) {
+        $assetRoot = Get-SnapshotAssetRoot -SnapshotPath $SnapshotPath
+        $assetPath = Join-Path $assetRoot ([string]$File.SnapshotAssetRelativePath)
+        if (-not (Test-Path -LiteralPath $assetPath)) {
+            throw "WDAC snapshot asset is missing: $assetPath"
+        }
+
+        return [System.IO.File]::ReadAllBytes($assetPath)
+    }
+
+    throw "WDAC snapshot content is missing for $([string]$File.RelativePath)"
+}
+
 function Write-WdacPolicyFiles {
-    param([Parameter(Mandatory)] [object[]]$Files)
+    param(
+        [Parameter(Mandatory)] [object[]]$Files,
+        [string]$SnapshotPath
+    )
 
     $root = Get-WdacCodeIntegrityRoot
     foreach ($file in @($Files)) {
         $destination = Join-Path $root ([string]$file.RelativePath)
-        Write-BytesAtomic -Path $destination -Content ([Convert]::FromBase64String([string]$file.Base64))
+        Write-BytesAtomic -Path $destination -Content (Get-WdacSnapshotFileBytes -File $file -SnapshotPath $SnapshotPath)
     }
 }
 
 function Restore-WdacPolicyFiles {
-    param([Parameter(Mandatory)] [object[]]$Files)
+    param(
+        [Parameter(Mandatory)] [object[]]$Files,
+        [string]$SnapshotPath
+    )
 
     Remove-WdacPolicyFiles
-    Write-WdacPolicyFiles -Files $Files
+    Write-WdacPolicyFiles -Files $Files -SnapshotPath $SnapshotPath
 }
 
 function Restore-WdacPolicies {
-    param([Parameter(Mandatory)] [object]$State)
+    param(
+        [Parameter(Mandatory)] [object]$State,
+        [string]$SnapshotPath
+    )
 
     $liveState = Get-WdacPolicyState
     Remove-WdacPolicies -State $liveState
@@ -1459,7 +1504,7 @@ function Restore-WdacPolicies {
         foreach ($file in $ciPolicyFiles) {
             $tempPath = New-TemporaryFilePath -Extension '.cip'
             try {
-                [System.IO.File]::WriteAllBytes($tempPath, [Convert]::FromBase64String([string]$file.Base64))
+                [System.IO.File]::WriteAllBytes($tempPath, (Get-WdacSnapshotFileBytes -File $file -SnapshotPath $SnapshotPath))
                 & $ciTool.Source -up $tempPath -json | Out-Null
                 if ($LASTEXITCODE -ne 0) {
                     throw "CiTool failed to restore WDAC policy from $tempPath"
@@ -1476,12 +1521,12 @@ function Restore-WdacPolicies {
         }
 
         if ($singlePolicyFiles.Count -gt 0) {
-            Write-WdacPolicyFiles -Files @($singlePolicyFiles)
+            Write-WdacPolicyFiles -Files @($singlePolicyFiles) -SnapshotPath $SnapshotPath
         }
         return
     }
 
-    Restore-WdacPolicyFiles -Files $files
+    Restore-WdacPolicyFiles -Files $files -SnapshotPath $SnapshotPath
 }
 
 function Get-AuditPolicyState {
@@ -2200,6 +2245,45 @@ function Get-VerificationReportLines {
     [string[]]$lines
 }
 
+function Persist-SnapshotExternalAssets {
+    param(
+        [Parameter(Mandatory)] [object]$Snapshot,
+        [Parameter(Mandatory)] [string]$SnapshotPath
+    )
+
+    $assetRoot = Get-SnapshotAssetRoot -SnapshotPath $SnapshotPath
+
+    foreach ($entry in @($Snapshot.Settings)) {
+        if ([string]$entry.Type -ne 'WdacPolicies' -or $null -eq $entry.CurrentValue) {
+            continue
+        }
+
+        $rewrittenFiles = @()
+        foreach ($file in @($entry.CurrentValue.Files)) {
+            $relativePath = [string]$file.RelativePath
+            $assetRelativePath = Join-Path 'wdac' $relativePath
+            $assetPath = Join-Path $assetRoot $assetRelativePath
+
+            if ($file.PSObject.Properties['Base64'] -and -not [string]::IsNullOrWhiteSpace([string]$file.Base64)) {
+                Write-BytesAtomic -Path $assetPath -Content ([Convert]::FromBase64String([string]$file.Base64))
+            }
+
+            $rewrittenFiles += [PSCustomObject]@{
+                RelativePath              = $relativePath
+                FileName                  = [string]$file.FileName
+                Sha256                    = [string]$file.Sha256
+                SnapshotAssetRelativePath = $assetRelativePath
+            }
+        }
+
+        $entry.CurrentValue = [PSCustomObject]@{
+            CiToolAvailable = $entry.CurrentValue.CiToolAvailable
+            Policies        = @($entry.CurrentValue.Policies)
+            Files           = @($rewrittenFiles)
+        }
+    }
+}
+
 function Get-DefenseDefinitions {
     $officeMacroApps = @('access', 'excel', 'powerpoint', 'project', 'publisher', 'visio', 'word')
     $officeMacroItems = foreach ($app in $officeMacroApps) {
@@ -2544,7 +2628,10 @@ function Apply-PermissiveDefinition {
 }
 
 function Restore-SnapshotEntry {
-    param([Parameter(Mandatory)] [object]$Entry)
+    param(
+        [Parameter(Mandatory)] [object]$Entry,
+        [string]$SnapshotPath
+    )
 
     if (-not (Test-SnapshotEntryCapturedExactly -Entry $Entry)) {
         Write-Warning "Skipping restore for $($Entry.Id) because the snapshot baseline was incomplete."
@@ -2573,7 +2660,7 @@ function Restore-SnapshotEntry {
             Apply-ExploitProtectionPolicyXml -Xml ([string]$Entry.CurrentValue.Xml)
         }
         'WdacPolicies' {
-            Restore-WdacPolicies -State $Entry.CurrentValue
+            Restore-WdacPolicies -State $Entry.CurrentValue -SnapshotPath $SnapshotPath
         }
         'AsrRules' {
             Restore-AsrRules -Rules @($Entry.CurrentValue)
@@ -2658,10 +2745,16 @@ function Export-DefenseSnapshot {
         Settings      = @($settings)
     }
 
+    Write-Verbose "[post/4] Persisting snapshot sidecar assets"
+    Persist-SnapshotExternalAssets -Snapshot $snapshot -SnapshotPath $fullPath
+
+    Write-Verbose "[post/4] Building snapshot report"
     $reportPath = Get-SnapshotReportPath -SnapshotPath $fullPath
     $reportLines = Get-SnapshotReportLines -Snapshot $snapshot -SnapshotPath $fullPath
 
+    Write-Verbose "[post/4] Writing snapshot JSON"
     Write-JsonAtomic -Path $fullPath -InputObject $snapshot
+    Write-Verbose "[post/4] Writing snapshot report"
     Write-TextAtomic -Path $reportPath -Content ($reportLines -join [Environment]::NewLine)
 
     [PSCustomObject]@{
@@ -2722,7 +2815,7 @@ function Restore-DefenseSnapshot {
     for ($i = 0; $i -lt $entries.Count; $i++) {
         $entry = $entries[$i]
         Write-Verbose ("[{0}/{1}] Restoring {2}" -f ($i + 1), $entries.Count, $entry.Id)
-        Restore-SnapshotEntry -Entry $entry
+        Restore-SnapshotEntry -Entry $entry -SnapshotPath $fullPath
     }
 
     $verification = Test-DefenseSnapshot -Snapshot $snapshot

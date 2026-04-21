@@ -54,6 +54,7 @@ WinDefState is a PowerShell tool for Windows defense testing. It snapshots the c
 ## Files on disk
 
 - Snapshots: `.\state\snapshots\HOST-YYYYMMDD-HHMMSS.json`
+- Snapshot sidecar assets: `.\state\snapshots\HOST-YYYYMMDD-HHMMSS.assets\`
 - Snapshot reports: `.\state\snapshots\HOST-YYYYMMDD-HHMMSS.txt`
 - Active run journal: `.\state\current-operation.json`
 - Restore verification reports: `.\state\verification\HOST-YYYYMMDD-HHMMSS-restore-check-YYYYMMDD-HHMMSS.txt`
@@ -88,6 +89,7 @@ You can also restore from a specific snapshot file:
 - BitLocker snapshot is bounded to mounted volumes and skips a mount point if the provider does not return in time
 - BitLocker permissive mode suspends protectors on currently protected mounted volumes and restore resumes them based on the captured protection state
 - Snapshot records incomplete captures, and permissive/restore skips any setting whose baseline could not be captured exactly
+- WDAC policy file payloads are stored as sidecar snapshot assets instead of inline Base64 in the main JSON snapshot
 - WDAC restore uses active OS Code Integrity policy files and `CiTool` when available; on older hosts a reboot can still be required before the live state fully matches the restored snapshot
 
 ## Next improvements
