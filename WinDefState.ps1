@@ -1091,8 +1091,8 @@ function Get-BitLockerVolumeStates {
         Write-Verbose ("BitLocker snapshot mount point {0}" -f $mountPoint)
         $escapedMountPoint = $mountPoint.Replace("'", "''")
         $result = Invoke-ChildPowerShell -TimeoutSeconds 12 -ScriptText @"
-$ErrorActionPreference = 'Stop'
-$volume = Get-BitLockerVolume -MountPoint '$escapedMountPoint' -ErrorAction SilentlyContinue
+`$ErrorActionPreference = 'Stop'
+`$volume = Get-BitLockerVolume -MountPoint '$escapedMountPoint' -ErrorAction SilentlyContinue
 if (`$null -eq `$volume) {
     return
 }
