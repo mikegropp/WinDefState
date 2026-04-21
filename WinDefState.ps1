@@ -953,30 +953,64 @@ function Get-AsrRestoreAction {
     }
 }
 
-function Get-ConfiguredAsrRules {
+function Test-AsrRuleId {
+    param([AllowNull()] [object]$Id)
+
+    $text = [string]$Id
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $false
+    }
+
+    $guid = [guid]::Empty
+    [guid]::TryParse($text, [ref]$guid)
+}
+
+function Get-AsrRuleCaptureState {
     $catalog = Get-AsrRuleCatalog
     $mp = Get-MpPreference -ErrorAction SilentlyContinue
     if ($null -eq $mp) {
-        return @()
+        return [PSCustomObject]@{
+            Rules          = @()
+            InvalidEntries = @()
+        }
     }
 
     $ids = @($mp.AttackSurfaceReductionRules_Ids)
     $actions = @($mp.AttackSurfaceReductionRules_Actions)
-    $rules = @()
+    $validRules = @()
+    $invalidEntries = @()
+    $entryCount = [Math]::Max($ids.Count, $actions.Count)
 
-    for ($i = 0; $i -lt $ids.Count; $i++) {
-        $id = [string]$ids[$i]
+    for ($i = 0; $i -lt $entryCount; $i++) {
+        $id = if ($ids.Count -gt $i) { [string]$ids[$i] } else { $null }
         $action = if ($actions.Count -gt $i) { [string]$actions[$i] } else { $null }
+        $actionLabel = Get-AsrActionLabel -Action $action
 
-        $rules += [PSCustomObject]@{
+        if (-not (Test-AsrRuleId -Id $id)) {
+            $invalidEntries += [PSCustomObject]@{
+                Id          = $id
+                Action      = $action
+                ActionLabel = $actionLabel
+            }
+            continue
+        }
+
+        $validRules += [PSCustomObject]@{
             Id          = $id
             Name        = if ($catalog.ContainsKey($id)) { $catalog[$id] } else { 'Unknown / custom rule' }
             Action      = $action
-            ActionLabel = Get-AsrActionLabel -Action $action
+            ActionLabel = $actionLabel
         }
     }
 
-    $rules
+    [PSCustomObject]@{
+        Rules          = @($validRules)
+        InvalidEntries = @($invalidEntries)
+    }
+}
+
+function Get-ConfiguredAsrRules {
+    @((Get-AsrRuleCaptureState).Rules)
 }
 
 function Disable-ConfiguredAsrRules {
@@ -986,6 +1020,10 @@ function Disable-ConfiguredAsrRules {
     }
 
     foreach ($id in @($mp.AttackSurfaceReductionRules_Ids)) {
+        if (-not (Test-AsrRuleId -Id $id)) {
+            continue
+        }
+
         Remove-MpPreference -AttackSurfaceReductionRules_Ids $id -ErrorAction SilentlyContinue
     }
 }
@@ -999,6 +1037,10 @@ function Restore-AsrRules {
     $actions = @()
 
     foreach ($rule in @($Rules)) {
+        if (-not (Test-AsrRuleId -Id $rule.Id)) {
+            continue
+        }
+
         $restoreAction = Get-AsrRestoreAction -Action $rule.Action
         if ($null -eq $restoreAction) {
             continue
@@ -1891,8 +1933,15 @@ function Add-SnapshotEntryReportLines {
         }
         'AsrRules' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Configured rule count' -Value @($Entry.CurrentValue).Count
+            $invalidEntries = if ($Entry.PSObject.Properties['InvalidEntries']) { @($Entry.InvalidEntries) } else { @() }
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Invalid capture entry count' -Value $invalidEntries.Count
             foreach ($rule in @($Entry.CurrentValue)) {
                 $Lines.Add(('  - {0} | {1} | {2}' -f $rule.Id, $rule.Name, $rule.ActionLabel))
+            }
+            foreach ($rule in $invalidEntries) {
+                $displayId = if ([string]::IsNullOrWhiteSpace([string]$rule.Id)) { '<blank>' } else { [string]$rule.Id }
+                $displayAction = if ([string]::IsNullOrWhiteSpace([string]$rule.ActionLabel)) { '<blank>' } else { [string]$rule.ActionLabel }
+                $Lines.Add(('  - INVALID | {0} | {1}' -f $displayId, $displayAction))
             }
         }
         'PowerShellModuleLogging' {
@@ -2094,11 +2143,20 @@ function ConvertTo-ComparableSnapshotEntry {
             })
         }
         'AsrRules' {
+            $invalidEntries = if ($Entry.PSObject.Properties['InvalidEntries']) { @($Entry.InvalidEntries) } else { @() }
             return ConvertTo-CanonicalValue -Value ([ordered]@{
                 Id             = $Entry.Id
                 Type           = $Entry.Type
                 CurrentValue   = @(
                     foreach ($rule in @($Entry.CurrentValue)) {
+                        [PSCustomObject]@{
+                            Id          = [string]$rule.Id
+                            ActionLabel = if ($null -ne $rule.PSObject.Properties['ActionLabel']) { [string]$rule.ActionLabel } else { Get-AsrActionLabel -Action $rule.Action }
+                        }
+                    }
+                )
+                InvalidEntries = @(
+                    foreach ($rule in $invalidEntries) {
                         [PSCustomObject]@{
                             Id          = [string]$rule.Id
                             ActionLabel = if ($null -ne $rule.PSObject.Properties['ActionLabel']) { [string]$rule.ActionLabel } else { Get-AsrActionLabel -Action $rule.Action }
@@ -2231,6 +2289,10 @@ function Test-SnapshotEntryCapturedExactly {
         }
         'ExploitProtectionPolicy' {
             return (Test-ExploitProtectionPolicyCapturedExactly -State $Entry.CurrentValue -SnapshotPath $SnapshotPath)
+        }
+        'AsrRules' {
+            $invalidEntries = if ($Entry.PSObject.Properties['InvalidEntries']) { @($Entry.InvalidEntries) } else { @() }
+            return ($invalidEntries.Count -eq 0)
         }
         'SmbClientConfig' {
             $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
@@ -2547,10 +2609,12 @@ function Capture-Definition {
             }
         }
         'AsrRules' {
+            $asrState = Get-AsrRuleCaptureState
             return [PSCustomObject]@{
                 Id             = $Definition.Id
                 Type           = 'AsrRules'
-                CurrentValue   = @(Get-ConfiguredAsrRules)
+                CurrentValue   = @($asrState.Rules)
+                InvalidEntries = @($asrState.InvalidEntries)
                 RequiresReboot = $Definition.RequiresReboot
             }
         }
