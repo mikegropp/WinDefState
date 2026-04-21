@@ -567,6 +567,26 @@ function ConvertFrom-WsManTextValue {
     }
 }
 
+function ConvertTo-NullableBoolean {
+    param([AllowNull()] [object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    if ($Value -is [bool]) {
+        return [bool]$Value
+    }
+
+    switch -Exact (([string]$Value).Trim().ToLowerInvariant()) {
+        'true' { return $true }
+        'false' { return $false }
+        '1' { return $true }
+        '0' { return $false }
+        default { return $null }
+    }
+}
+
 function ConvertTo-WsManPolicyDword {
     param([AllowNull()] [object]$Value)
 
@@ -652,6 +672,126 @@ function Set-WsManConfigValue {
     }
 
     New-ItemProperty -Path $target.RegistryPath -Name $target.Name -PropertyType DWord -Value $registryValue -Force | Out-Null
+}
+
+function Normalize-SmbConfigState {
+    param([AllowNull()] [object]$Value)
+
+    if ($Value -is [bool] -or $Value -is [string] -or $Value -is [int] -or $Value -is [long]) {
+        $legacyValue = ConvertTo-NullableBoolean -Value $Value
+        if ($null -ne $legacyValue) {
+            return [PSCustomObject]@{
+                CommandAvailable         = $true
+                TimedOut                 = $false
+                RequireSecuritySignature = $legacyValue
+            }
+        }
+    }
+
+    if ($null -eq $Value) {
+        return [PSCustomObject]@{
+            CommandAvailable         = $false
+            TimedOut                 = $false
+            RequireSecuritySignature = $null
+        }
+    }
+
+    $commandAvailable = if ($Value.PSObject.Properties['CommandAvailable']) { [bool]$Value.CommandAvailable } else { $true }
+    $timedOut = if ($Value.PSObject.Properties['TimedOut']) { [bool]$Value.TimedOut } else { $false }
+    $requireSecuritySignature = if ($Value.PSObject.Properties['RequireSecuritySignature']) {
+        ConvertTo-NullableBoolean -Value $Value.RequireSecuritySignature
+    } else {
+        ConvertTo-NullableBoolean -Value $Value
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable         = $commandAvailable
+        TimedOut                 = $timedOut
+        RequireSecuritySignature = $requireSecuritySignature
+    }
+}
+
+function Get-SmbConfigurationState {
+    param([Parameter(Mandatory)] [ValidateSet('Client', 'Server')] [string]$Role)
+
+    $commandName = if ($Role -eq 'Client') { 'Get-SmbClientConfiguration' } else { 'Get-SmbServerConfiguration' }
+    $roleLabel = if ($Role -eq 'Client') { 'SMB client' } else { 'SMB server' }
+
+    if (-not (Test-CommandAvailable -Name $commandName)) {
+        return Normalize-SmbConfigState -Value $null
+    }
+
+    $result = Invoke-ChildPowerShell -TimeoutSeconds 12 -ScriptText @"
+`$ErrorActionPreference = 'Stop'
+`$config = & $commandName -ErrorAction Stop
+[PSCustomObject]@{
+    RequireSecuritySignature = [bool]`$config.RequireSecuritySignature
+} | ConvertTo-Json -Compress -Depth 4
+"@
+
+    if ($result.TimedOut) {
+        Write-Warning "$roleLabel snapshot timed out. Skipping this setting."
+        return Normalize-SmbConfigState -Value ([PSCustomObject]@{
+            CommandAvailable         = $true
+            TimedOut                 = $true
+            RequireSecuritySignature = $null
+        })
+    }
+
+    if ($result.ExitCode -ne 0) {
+        if (-not [string]::IsNullOrWhiteSpace([string]$result.StdErr)) {
+            Write-Warning ("{0} snapshot failed: {1}" -f $roleLabel, $result.StdErr.Trim())
+        } else {
+            Write-Warning "$roleLabel snapshot failed. Skipping this setting."
+        }
+
+        return Normalize-SmbConfigState -Value ([PSCustomObject]@{
+            CommandAvailable         = $true
+            TimedOut                 = $false
+            RequireSecuritySignature = $null
+        })
+    }
+
+    $json = [string]$result.StdOut
+    if ([string]::IsNullOrWhiteSpace($json)) {
+        Write-Warning "$roleLabel snapshot returned no data. Skipping this setting."
+        return Normalize-SmbConfigState -Value ([PSCustomObject]@{
+            CommandAvailable         = $true
+            TimedOut                 = $false
+            RequireSecuritySignature = $null
+        })
+    }
+
+    try {
+        $parsed = $json | ConvertFrom-Json -ErrorAction Stop
+    } catch {
+        Write-Warning "$roleLabel snapshot returned unparsable output. Skipping this setting."
+        return Normalize-SmbConfigState -Value ([PSCustomObject]@{
+            CommandAvailable         = $true
+            TimedOut                 = $false
+            RequireSecuritySignature = $null
+        })
+    }
+
+    $requireSecuritySignature = if ($parsed.PSObject.Properties['RequireSecuritySignature']) {
+        ConvertTo-NullableBoolean -Value $parsed.RequireSecuritySignature
+    } else {
+        $null
+    }
+
+    Normalize-SmbConfigState -Value ([PSCustomObject]@{
+        CommandAvailable         = $true
+        TimedOut                 = $false
+        RequireSecuritySignature = $requireSecuritySignature
+    })
+}
+
+function Get-SmbClientConfigurationState {
+    Get-SmbConfigurationState -Role 'Client'
+}
+
+function Get-SmbServerConfigurationState {
+    Get-SmbConfigurationState -Role 'Server'
 }
 
 function Get-NetBiosAdapterStates {
@@ -888,6 +1028,48 @@ function Test-BitLockerProtectionEnabled {
     (ConvertTo-BitLockerProtectionStatusLabel -Value $Value) -eq 'On'
 }
 
+function Get-BitLockerTimedOutMountPoints {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State -or -not $State.PSObject.Properties['TimedOutMountPoints']) {
+        return @()
+    }
+
+    @(
+        foreach ($mountPoint in @($State.TimedOutMountPoints)) {
+            if (-not [string]::IsNullOrWhiteSpace([string]$mountPoint)) {
+                [string]$mountPoint
+            }
+        }
+    )
+}
+
+function Get-BitLockerCommandAvailableFlag {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State) {
+        return $false
+    }
+
+    if ($State.PSObject.Properties['CommandAvailable']) {
+        return [bool]$State.CommandAvailable
+    }
+
+    $true
+}
+
+function Test-BitLockerStateCapturedExactly {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State) {
+        return $false
+    }
+
+    $commandAvailable = Get-BitLockerCommandAvailableFlag -State $State
+    $timedOutMountPoints = @(Get-BitLockerTimedOutMountPoints -State $State)
+    $commandAvailable -and ($timedOutMountPoints.Count -eq 0)
+}
+
 function Get-BitLockerVolumeStates {
     if (-not (Test-CommandAvailable -Name 'Get-BitLockerVolume')) {
         return [PSCustomObject]@{
@@ -970,11 +1152,25 @@ if (`$null -eq `$volume) {
 }
 
 function Set-Permissive-BitLockerVolumes {
-    if (-not (Test-CommandAvailable -Name 'Get-BitLockerVolume') -or -not (Test-CommandAvailable -Name 'Suspend-BitLocker')) {
+    param([AllowNull()] [object]$State)
+
+    if (-not (Test-CommandAvailable -Name 'Suspend-BitLocker')) {
         return
     }
 
-    foreach ($volume in @((Get-BitLockerVolumeStates).Volumes)) {
+    if ($null -eq $State) {
+        if (-not (Test-CommandAvailable -Name 'Get-BitLockerVolume')) {
+            return
+        }
+
+        $State = Get-BitLockerVolumeStates
+    }
+
+    if (-not (Test-BitLockerStateCapturedExactly -State $State)) {
+        return
+    }
+
+    foreach ($volume in @($State.Volumes)) {
         if (-not (Test-BitLockerProtectionEnabled -Value $volume.ProtectionStatus)) {
             continue
         }
@@ -992,7 +1188,7 @@ function Set-Permissive-BitLockerVolumes {
 function Restore-BitLockerVolumes {
     param([Parameter(Mandatory)] [object]$State)
 
-    if (-not $State.CommandAvailable) {
+    if (-not (Test-BitLockerStateCapturedExactly -State $State)) {
         return
     }
 
@@ -1522,8 +1718,8 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Restore value' -Value $Entry.RestoreValue
         }
         'BitLockerVolumes' {
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $Entry.CurrentValue.CommandAvailable
-            Add-ReportJsonBlock -Lines $Lines -Label 'Timed out mount points' -Value @($Entry.CurrentValue.TimedOutMountPoints)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value (Get-BitLockerCommandAvailableFlag -State $Entry.CurrentValue)
+            Add-ReportJsonBlock -Lines $Lines -Label 'Timed out mount points' -Value @(Get-BitLockerTimedOutMountPoints -State $Entry.CurrentValue)
             foreach ($volume in @($Entry.CurrentValue.Volumes)) {
                 $Lines.Add(('  - {0} | Protection={1} | Status={2} | Encryption={3}% | Protectors={4}' -f $volume.MountPoint, $volume.ProtectionStatus, $volume.VolumeStatus, $volume.EncryptionPercentage, $volume.KeyProtectorCount))
             }
@@ -1604,10 +1800,16 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Failure' -Value $Entry.CurrentValue.Failure
         }
         'SmbClientConfig' {
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Require security signature' -Value $Entry.CurrentValue
+            $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $state.CommandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Timed out' -Value $state.TimedOut
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Require security signature' -Value $state.RequireSecuritySignature
         }
         'SmbServerConfig' {
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Require security signature' -Value $Entry.CurrentValue
+            $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $state.CommandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Timed out' -Value $state.TimedOut
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Require security signature' -Value $state.RequireSecuritySignature
         }
         default {
             Add-ReportJsonBlock -Lines $Lines -Label 'Current value' -Value $Entry.CurrentValue
@@ -1679,13 +1881,14 @@ function ConvertTo-ComparableSnapshotEntry {
             })
         }
         'BitLockerVolumes' {
+            $timedOutMountPoints = @(Get-BitLockerTimedOutMountPoints -State $Entry.CurrentValue)
             return ConvertTo-CanonicalValue -Value ([ordered]@{
                 Id             = $Entry.Id
                 Type           = $Entry.Type
                 CurrentValue   = [ordered]@{
-                    CommandAvailable    = $Entry.CurrentValue.CommandAvailable
+                    CommandAvailable    = Get-BitLockerCommandAvailableFlag -State $Entry.CurrentValue
                     TimedOutMountPoints = @(
-                        foreach ($mountPoint in @($Entry.CurrentValue.TimedOutMountPoints)) {
+                        foreach ($mountPoint in $timedOutMountPoints) {
                             [string]$mountPoint
                         }
                     )
@@ -1837,8 +2040,63 @@ function ConvertTo-ComparableSnapshotEntry {
                 RequiresReboot = $Entry.RequiresReboot
             })
         }
+        'SmbClientConfig' {
+            $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = [ordered]@{
+                    CommandAvailable         = $state.CommandAvailable
+                    TimedOut                 = $state.TimedOut
+                    RequireSecuritySignature = $state.RequireSecuritySignature
+                }
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'SmbServerConfig' {
+            $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = [ordered]@{
+                    CommandAvailable         = $state.CommandAvailable
+                    TimedOut                 = $state.TimedOut
+                    RequireSecuritySignature = $state.RequireSecuritySignature
+                }
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
         default {
             return ConvertTo-CanonicalValue -Value $Entry
+        }
+    }
+}
+
+function Test-SnapshotEntryCapturedExactly {
+    param([Parameter(Mandatory)] [object]$Entry)
+
+    switch ($Entry.Type) {
+        'BitLockerVolumes' {
+            return (Test-BitLockerStateCapturedExactly -State $Entry.CurrentValue)
+        }
+        'ExploitProtectionPolicy' {
+            $commandAvailable = if ($null -ne $Entry.CurrentValue -and $Entry.CurrentValue.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CurrentValue.CommandAvailable } else { $true }
+            return (
+                $null -ne $Entry.CurrentValue -and
+                $commandAvailable -and
+                -not [string]::IsNullOrWhiteSpace([string]$Entry.CurrentValue.Xml)
+            )
+        }
+        'SmbClientConfig' {
+            $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
+            return $state.CommandAvailable -and -not $state.TimedOut -and $null -ne $state.RequireSecuritySignature
+        }
+        'SmbServerConfig' {
+            $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
+            return $state.CommandAvailable -and -not $state.TimedOut -and $null -ne $state.RequireSecuritySignature
+        }
+        default {
+            return $true
         }
     }
 }
@@ -2184,20 +2442,18 @@ function Capture-Definition {
             }
         }
         'SmbClientConfig' {
-            $config = Get-SmbClientConfiguration
             return [PSCustomObject]@{
                 Id             = $Definition.Id
                 Type           = 'SmbClientConfig'
-                CurrentValue   = $config.RequireSecuritySignature
+                CurrentValue   = Get-SmbClientConfigurationState
                 RequiresReboot = $Definition.RequiresReboot
             }
         }
         'SmbServerConfig' {
-            $config = Get-SmbServerConfiguration
             return [PSCustomObject]@{
                 Id             = $Definition.Id
                 Type           = 'SmbServerConfig'
-                CurrentValue   = $config.RequireSecuritySignature
+                CurrentValue   = Get-SmbServerConfigurationState
                 RequiresReboot = $Definition.RequiresReboot
             }
         }
@@ -2205,7 +2461,10 @@ function Capture-Definition {
 }
 
 function Apply-PermissiveDefinition {
-    param([Parameter(Mandatory)] [object]$Definition)
+    param(
+        [Parameter(Mandatory)] [object]$Definition,
+        [AllowNull()] [object]$Entry
+    )
 
     switch ($Definition.Type) {
         'RegistryValue' {
@@ -2223,7 +2482,8 @@ function Apply-PermissiveDefinition {
             Set-MpPreferencePropertyValue -Property $Definition.Property -Value $Definition.PermissiveValue
         }
         'BitLockerVolumes' {
-            Set-Permissive-BitLockerVolumes
+            $bitLockerState = if ($null -ne $Entry) { $Entry.CurrentValue } else { $null }
+            Set-Permissive-BitLockerVolumes -State $bitLockerState
         }
         'ExploitProtectionPolicy' {
             Set-Permissive-ExploitProtection
@@ -2271,16 +2531,25 @@ function Apply-PermissiveDefinition {
             Set-AuditPolicyState -Subcategory $Definition.Subcategory -Success $Definition.PermissiveSuccess -Failure $Definition.PermissiveFailure
         }
         'SmbClientConfig' {
-            Set-SmbClientConfiguration -RequireSecuritySignature $Definition.PermissiveValue -Confirm:$false | Out-Null
+            if (Test-CommandAvailable -Name 'Set-SmbClientConfiguration') {
+                Set-SmbClientConfiguration -RequireSecuritySignature $Definition.PermissiveValue -Confirm:$false | Out-Null
+            }
         }
         'SmbServerConfig' {
-            Set-SmbServerConfiguration -RequireSecuritySignature $Definition.PermissiveValue -Confirm:$false | Out-Null
+            if (Test-CommandAvailable -Name 'Set-SmbServerConfiguration') {
+                Set-SmbServerConfiguration -RequireSecuritySignature $Definition.PermissiveValue -Confirm:$false | Out-Null
+            }
         }
     }
 }
 
 function Restore-SnapshotEntry {
     param([Parameter(Mandatory)] [object]$Entry)
+
+    if (-not (Test-SnapshotEntryCapturedExactly -Entry $Entry)) {
+        Write-Warning "Skipping restore for $($Entry.Id) because the snapshot baseline was incomplete."
+        return
+    }
 
     switch ($Entry.Type) {
         'RegistryValue' {
@@ -2354,10 +2623,16 @@ function Restore-SnapshotEntry {
             Set-AuditPolicyState -Subcategory $Entry.Subcategory -Success ([bool]$Entry.CurrentValue.Success) -Failure ([bool]$Entry.CurrentValue.Failure)
         }
         'SmbClientConfig' {
-            Set-SmbClientConfiguration -RequireSecuritySignature ([bool]$Entry.CurrentValue) -Confirm:$false | Out-Null
+            $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
+            if (Test-CommandAvailable -Name 'Set-SmbClientConfiguration') {
+                Set-SmbClientConfiguration -RequireSecuritySignature ([bool]$state.RequireSecuritySignature) -Confirm:$false | Out-Null
+            }
         }
         'SmbServerConfig' {
-            Set-SmbServerConfiguration -RequireSecuritySignature ([bool]$Entry.CurrentValue) -Confirm:$false | Out-Null
+            $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
+            if (Test-CommandAvailable -Name 'Set-SmbServerConfiguration') {
+                Set-SmbServerConfiguration -RequireSecuritySignature ([bool]$state.RequireSecuritySignature) -Confirm:$false | Out-Null
+            }
         }
     }
 }
@@ -2408,10 +2683,21 @@ function Set-DefensePermissive {
     Write-OperationState -Root $StateRoot -SnapshotPath $export.JsonPath -Mode 'Permissive'
 
     $definitions = @(Get-DefenseDefinitions)
+    $snapshotEntriesById = @{}
+    foreach ($entry in @($export.Snapshot.Settings)) {
+        $snapshotEntriesById[[string]$entry.Id] = $entry
+    }
+
     for ($i = 0; $i -lt $definitions.Count; $i++) {
         $definition = $definitions[$i]
         Write-Verbose ("[{0}/{1}] Applying permissive setting {2}" -f ($i + 1), $definitions.Count, $definition.Id)
-        Apply-PermissiveDefinition -Definition $definition
+        $entry = if ($snapshotEntriesById.ContainsKey([string]$definition.Id)) { $snapshotEntriesById[[string]$definition.Id] } else { $null }
+        if ($null -ne $entry -and -not (Test-SnapshotEntryCapturedExactly -Entry $entry)) {
+            Write-Warning "Skipping permissive change for $($definition.Id) because the baseline capture was incomplete."
+            continue
+        }
+
+        Apply-PermissiveDefinition -Definition $definition -Entry $entry
     }
 
     Write-Host "Permissive mode applied. Snapshot JSON saved to: $($export.JsonPath)"
