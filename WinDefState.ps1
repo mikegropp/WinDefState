@@ -842,12 +842,18 @@ function Get-BitLockerVolumeStates {
         }
     }
 
-    $volumes = Get-BitLockerVolume -ErrorAction SilentlyContinue
-    $states = foreach ($volume in @($volumes)) {
-        $mountPoint = if ($volume.MountPoint -is [System.Array]) {
-            [string]($volume.MountPoint | Select-Object -First 1)
-        } else {
-            [string]$volume.MountPoint
+    $mountPoints = @(
+        Get-CimInstance -ClassName Win32_LogicalDisk -Filter 'DriveType = 2 OR DriveType = 3' -ErrorAction SilentlyContinue |
+            Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_.DeviceID) } |
+            ForEach-Object { [string]$_.DeviceID } |
+            Sort-Object -Unique
+    )
+
+    $states = foreach ($mountPoint in $mountPoints) {
+        Write-Verbose ("BitLocker snapshot mount point {0}" -f $mountPoint)
+        $volume = Get-BitLockerVolume -MountPoint $mountPoint -ErrorAction SilentlyContinue
+        if ($null -eq $volume) {
+            continue
         }
 
         [PSCustomObject]@{
@@ -857,8 +863,8 @@ function Get-BitLockerVolumeStates {
             VolumeStatus         = [string]$volume.VolumeStatus
             EncryptionMethod     = [string]$volume.EncryptionMethod
             EncryptionPercentage = if ($null -ne $volume.EncryptionPercentage) { [int]$volume.EncryptionPercentage } else { $null }
-            KeyProtectorCount    = @($volume.KeyProtector).Count
-            AutoUnlockEnabled    = if ($volume.PSObject.Properties['AutoUnlockEnabled']) { [bool]$volume.AutoUnlockEnabled } else { $null }
+            KeyProtectorCount    = $null
+            AutoUnlockEnabled    = $null
         }
     }
 
@@ -873,16 +879,12 @@ function Set-Permissive-BitLockerVolumes {
         return
     }
 
-    foreach ($volume in @(Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
+    foreach ($volume in @((Get-BitLockerVolumeStates).Volumes)) {
         if (-not (Test-BitLockerProtectionEnabled -Value $volume.ProtectionStatus)) {
             continue
         }
 
-        $mountPoint = if ($volume.MountPoint -is [System.Array]) {
-            [string]($volume.MountPoint | Select-Object -First 1)
-        } else {
-            [string]$volume.MountPoint
-        }
+        $mountPoint = [string]$volume.MountPoint
 
         if ([string]::IsNullOrWhiteSpace($mountPoint)) {
             continue
@@ -925,7 +927,6 @@ function Restore-BitLockerVolumes {
         if (
             $targetProtection -eq 'Off' -and
             [string]$volume.VolumeStatus -ne 'FullyDecrypted' -and
-            [int]$volume.KeyProtectorCount -gt 0 -and
             (Test-CommandAvailable -Name 'Suspend-BitLocker')
         ) {
             Suspend-BitLocker -MountPoint $mountPoint -RebootCount 0 -ErrorAction SilentlyContinue | Out-Null
