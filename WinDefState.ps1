@@ -2557,12 +2557,27 @@ function Test-DefenseSnapshot {
         $entryId = [string]$entry.Id
         $expectedComparable = ConvertTo-ComparableSnapshotEntry -Entry $entry -SnapshotPath $SnapshotPath
 
+        if (-not (Test-SnapshotEntryCapturedExactly -Entry $entry -SnapshotPath $SnapshotPath)) {
+            $results += [PSCustomObject]@{
+                Id             = $entryId
+                Type           = $entry.Type
+                RequiresReboot = $entry.RequiresReboot
+                Matches        = $false
+                Skipped        = $true
+                Reason         = 'Verification skipped because the snapshot baseline was incomplete.'
+                Expected       = $expectedComparable
+                Actual         = $null
+            }
+            continue
+        }
+
         if (-not $definitions.ContainsKey($entryId)) {
             $results += [PSCustomObject]@{
                 Id             = $entryId
                 Type           = $entry.Type
                 RequiresReboot = $entry.RequiresReboot
                 Matches        = $false
+                Skipped        = $false
                 Reason         = 'This snapshot entry no longer has a matching definition in the current script.'
                 Expected       = $expectedComparable
                 Actual         = $null
@@ -2580,6 +2595,7 @@ function Test-DefenseSnapshot {
                 Type           = $entry.Type
                 RequiresReboot = $entry.RequiresReboot
                 Matches        = $matches
+                Skipped        = $false
                 Reason         = if ($matches) { $null } else { 'Live state does not match the snapshot entry.' }
                 Expected       = $expectedComparable
                 Actual         = $actualComparable
@@ -2590,6 +2606,7 @@ function Test-DefenseSnapshot {
                 Type           = $entry.Type
                 RequiresReboot = $entry.RequiresReboot
                 Matches        = $false
+                Skipped        = $false
                 Reason         = $_.Exception.Message
                 Expected       = $expectedComparable
                 Actual         = $null
@@ -2601,8 +2618,9 @@ function Test-DefenseSnapshot {
         Tool          = 'WinDefState'
         ComputerName  = $env:COMPUTERNAME
         VerifiedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
-        MatchedCount  = @($results | Where-Object { $_.Matches }).Count
-        MismatchCount = @($results | Where-Object { -not $_.Matches }).Count
+        MatchedCount  = @($results | Where-Object { $_.Matches -and -not $_.Skipped }).Count
+        SkippedCount  = @($results | Where-Object { $_.Skipped }).Count
+        MismatchCount = @($results | Where-Object { -not $_.Matches -and -not $_.Skipped }).Count
         Results       = @($results)
     }
 }
@@ -2614,18 +2632,36 @@ function Get-VerificationReportLines {
     )
 
     $lines = [System.Collections.Generic.List[string]]::new()
-    $mismatches = @($Verification.Results | Where-Object { -not $_.Matches })
+    $mismatches = @($Verification.Results | Where-Object { -not $_.Matches -and -not $_.Skipped })
+    $skipped = @($Verification.Results | Where-Object { $_.Skipped })
 
     $lines.Add('WinDefState Restore Verification')
     $lines.Add(('Snapshot JSON: {0}' -f $SnapshotPath))
     $lines.Add(('ComputerName: {0}' -f $Verification.ComputerName))
     $lines.Add(('VerifiedAtUtc: {0}' -f $Verification.VerifiedAtUtc))
     $lines.Add(('Matched settings: {0}' -f $Verification.MatchedCount))
+    $lines.Add(('Skipped settings: {0}' -f $Verification.SkippedCount))
     $lines.Add(('Mismatched settings: {0}' -f $Verification.MismatchCount))
 
     if ($mismatches.Count -eq 0) {
         $lines.Add(' ')
-        $lines.Add('All captured settings match the requested snapshot.')
+        if ($skipped.Count -eq 0) {
+            $lines.Add('All captured settings match the requested snapshot.')
+        } else {
+            $lines.Add('All fully captured settings match the requested snapshot.')
+        }
+    }
+
+    foreach ($skippedResult in $skipped) {
+        $lines.Add(' ')
+        $lines.Add("[$($skippedResult.Id)] $($skippedResult.Type)")
+        Add-ReportKeyValueLine -Lines $lines -Label 'Requires reboot' -Value $skippedResult.RequiresReboot
+        if (-not [string]::IsNullOrWhiteSpace([string]$skippedResult.Reason)) {
+            Add-ReportKeyValueLine -Lines $lines -Label 'Reason' -Value $skippedResult.Reason
+        }
+    }
+
+    if ($mismatches.Count -eq 0) {
         return [string[]]$lines
     }
 
@@ -3239,7 +3275,7 @@ function Restore-DefenseSnapshot {
     Write-TextAtomic -Path $verificationPath -Content ($verificationLines -join [Environment]::NewLine)
 
     if ($verification.MismatchCount -gt 0) {
-        $mismatchIds = @($verification.Results | Where-Object { -not $_.Matches } | ForEach-Object { $_.Id })
+        $mismatchIds = @($verification.Results | Where-Object { -not $_.Matches -and -not $_.Skipped } | ForEach-Object { $_.Id })
         Write-Warning "Restore verification found $($verification.MismatchCount) mismatched setting(s)."
         Write-Warning "Verification report saved to: $verificationPath"
         Write-Warning ("Mismatched IDs: {0}" -f ($mismatchIds -join ', '))
@@ -3249,6 +3285,10 @@ function Restore-DefenseSnapshot {
     Clear-OperationState -Root $StateRoot
     Write-Host "Restore completed and verified from snapshot: $fullPath"
     Write-Host "Verification report saved to: $verificationPath"
+    if ($verification.SkippedCount -gt 0) {
+        $skippedIds = @($verification.Results | Where-Object { $_.Skipped } | ForEach-Object { $_.Id })
+        Write-Warning ("Verification skipped {0} setting(s) because the snapshot baseline was incomplete: {1}" -f $verification.SkippedCount, ($skippedIds -join ', '))
+    }
 }
 
 Assert-Administrator
