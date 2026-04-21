@@ -482,6 +482,22 @@ function ConvertTo-WsManTextValue {
     }
 }
 
+function ConvertFrom-WsManTextValue {
+    param([AllowNull()] [object]$Value)
+
+    if ($null -eq $Value) {
+        return $null
+    }
+
+    switch -Exact (([string]$Value).Trim().ToLowerInvariant()) {
+        'true' { return $true }
+        'false' { return $false }
+        '1' { return $true }
+        '0' { return $false }
+        default { return ([string]$Value).Trim() }
+    }
+}
+
 function ConvertTo-WsManPolicyDword {
     param([AllowNull()] [object]$Value)
 
@@ -536,6 +552,72 @@ function Get-WsManPolicyTarget {
             throw "Unsupported WSMan path for policy write: $Path"
         }
     }
+}
+
+function Get-WsManCliTarget {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    switch ($Path) {
+        'WSMan:\localhost\Service\AllowUnencrypted' {
+            return [PSCustomObject]@{
+                Resource = 'winrm/config/service'
+                Property = 'AllowUnencrypted'
+            }
+        }
+        'WSMan:\localhost\Client\AllowUnencrypted' {
+            return [PSCustomObject]@{
+                Resource = 'winrm/config/client'
+                Property = 'AllowUnencrypted'
+            }
+        }
+        'WSMan:\localhost\Service\Auth\Basic' {
+            return [PSCustomObject]@{
+                Resource = 'winrm/config/service/auth'
+                Property = 'Basic'
+            }
+        }
+        'WSMan:\localhost\Client\Auth\Basic' {
+            return [PSCustomObject]@{
+                Resource = 'winrm/config/client/auth'
+                Property = 'Basic'
+            }
+        }
+        default {
+            throw "Unsupported WSMan path for CLI read: $Path"
+        }
+    }
+}
+
+function Get-WsManConfigValue {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $policyTarget = Get-WsManPolicyTarget -Path $Path
+    $policyItem = Get-ItemProperty -Path $policyTarget.RegistryPath -Name $policyTarget.Name -ErrorAction SilentlyContinue
+    if ($null -ne $policyItem -and $null -ne $policyItem.$($policyTarget.Name)) {
+        return ConvertFrom-WsManTextValue -Value $policyItem.$($policyTarget.Name)
+    }
+
+    $winrmCommand = Get-Command -Name 'winrm.cmd' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $winrmCommand) {
+        $winrmCommand = Get-Command -Name 'winrm' -ErrorAction SilentlyContinue | Select-Object -First 1
+    }
+
+    if ($null -eq $winrmCommand) {
+        return $null
+    }
+
+    $cliTarget = Get-WsManCliTarget -Path $Path
+    $output = & $winrmCommand.Source get $cliTarget.Resource 2>$null | Out-String
+    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($output)) {
+        return $null
+    }
+
+    $match = [regex]::Match($output, "(?im)^\s*$([regex]::Escape($cliTarget.Property))\s*=\s*([^\s\[]+)")
+    if (-not $match.Success) {
+        return $null
+    }
+
+    ConvertFrom-WsManTextValue -Value $match.Groups[1].Value
 }
 
 function Set-WsManConfigValue {
@@ -2021,12 +2103,11 @@ function Capture-Definition {
             }
         }
         'WsManValue' {
-            $item = Get-Item -Path $Definition.Path -ErrorAction SilentlyContinue
             return [PSCustomObject]@{
                 Id             = $Definition.Id
                 Type           = 'WsManValue'
                 Path           = $Definition.Path
-                CurrentValue   = if ($null -ne $item) { $item.Value } else { $null }
+                CurrentValue   = Get-WsManConfigValue -Path $Definition.Path
                 RequiresReboot = $Definition.RequiresReboot
             }
         }
