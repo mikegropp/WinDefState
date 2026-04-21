@@ -554,40 +554,6 @@ function Get-WsManPolicyTarget {
     }
 }
 
-function Get-WsManCliTarget {
-    param([Parameter(Mandatory)] [string]$Path)
-
-    switch ($Path) {
-        'WSMan:\localhost\Service\AllowUnencrypted' {
-            return [PSCustomObject]@{
-                Resource = 'winrm/config/service'
-                Property = 'AllowUnencrypted'
-            }
-        }
-        'WSMan:\localhost\Client\AllowUnencrypted' {
-            return [PSCustomObject]@{
-                Resource = 'winrm/config/client'
-                Property = 'AllowUnencrypted'
-            }
-        }
-        'WSMan:\localhost\Service\Auth\Basic' {
-            return [PSCustomObject]@{
-                Resource = 'winrm/config/service/auth'
-                Property = 'Basic'
-            }
-        }
-        'WSMan:\localhost\Client\Auth\Basic' {
-            return [PSCustomObject]@{
-                Resource = 'winrm/config/client/auth'
-                Property = 'Basic'
-            }
-        }
-        default {
-            throw "Unsupported WSMan path for CLI read: $Path"
-        }
-    }
-}
-
 function Get-WsManConfigValue {
     param([Parameter(Mandatory)] [string]$Path)
 
@@ -597,27 +563,7 @@ function Get-WsManConfigValue {
         return ConvertFrom-WsManTextValue -Value $policyItem.$($policyTarget.Name)
     }
 
-    $winrmCommand = Get-Command -Name 'winrm.cmd' -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($null -eq $winrmCommand) {
-        $winrmCommand = Get-Command -Name 'winrm' -ErrorAction SilentlyContinue | Select-Object -First 1
-    }
-
-    if ($null -eq $winrmCommand) {
-        return $null
-    }
-
-    $cliTarget = Get-WsManCliTarget -Path $Path
-    $output = & $winrmCommand.Source get $cliTarget.Resource 2>$null | Out-String
-    if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($output)) {
-        return $null
-    }
-
-    $match = [regex]::Match($output, "(?im)^\s*$([regex]::Escape($cliTarget.Property))\s*=\s*([^\s\[]+)")
-    if (-not $match.Success) {
-        return $null
-    }
-
-    ConvertFrom-WsManTextValue -Value $match.Groups[1].Value
+    $null
 }
 
 function Set-WsManConfigValue {
