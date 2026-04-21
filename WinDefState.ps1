@@ -718,11 +718,15 @@ function Restore-AsrRules {
 function Set-MpPreferencePropertyValue {
     param(
         [Parameter(Mandatory)] [string]$Property,
-        [Parameter(Mandatory)] [object]$Value
+        [Parameter(Mandatory)] [AllowNull()] [object]$Value
     )
 
     $command = Get-Command -Name 'Set-MpPreference' -ErrorAction SilentlyContinue
     if ($null -eq $command -or -not $command.Parameters.ContainsKey($Property)) {
+        return
+    }
+
+    if ($null -eq $Value) {
         return
     }
 
@@ -750,7 +754,7 @@ function Get-MpPreferencePropertyRawValue {
 function Resolve-MpPreferenceValue {
     param(
         [Parameter(Mandatory)] [object]$Definition,
-        [Parameter(Mandatory)] [object]$Value
+        [Parameter(Mandatory)] [AllowNull()] [object]$Value
     )
 
     $valueMapProperty = $Definition.PSObject.Properties['ValueMap']
