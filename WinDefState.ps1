@@ -86,6 +86,55 @@ function Write-TextAtomic {
     Move-Item -LiteralPath $tempPath -Destination $resolvedPath -Force
 }
 
+function Write-BytesAtomic {
+    param(
+        [Parameter(Mandatory)] [string]$Path,
+        [Parameter(Mandatory)] [byte[]]$Content
+    )
+
+    $resolvedPath = Resolve-FileSystemPath -Path $Path
+    $parent = Split-Path -Parent $resolvedPath
+    if (-not [string]::IsNullOrWhiteSpace($parent)) {
+        Ensure-Directory -Path $parent
+    }
+
+    $tempPath = Join-Path $parent ((Split-Path -Leaf $resolvedPath) + '.tmp')
+    [System.IO.File]::WriteAllBytes($tempPath, $Content)
+
+    if (Test-Path -LiteralPath $resolvedPath) {
+        Remove-Item -LiteralPath $resolvedPath -Force -ErrorAction SilentlyContinue
+    }
+
+    Move-Item -LiteralPath $tempPath -Destination $resolvedPath -Force
+}
+
+function New-TemporaryFilePath {
+    param([string]$Extension = '.tmp')
+
+    if (-not $Extension.StartsWith('.')) {
+        $Extension = ".$Extension"
+    }
+
+    Join-Path ([System.IO.Path]::GetTempPath()) ("WinDefState-{0}{1}" -f ([guid]::NewGuid().ToString('N')), $Extension)
+}
+
+function Test-CommandAvailable {
+    param([Parameter(Mandatory)] [string]$Name)
+
+    $null -ne (Get-Command -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
+function Get-CiToolCommand {
+    foreach ($name in @('CiTool.exe', 'CiTool')) {
+        $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) {
+            return $command
+        }
+    }
+
+    $null
+}
+
 function Read-JsonFile {
     param([Parameter(Mandatory)] [string]$Path)
 
@@ -672,9 +721,30 @@ function Set-MpPreferencePropertyValue {
         [Parameter(Mandatory)] [object]$Value
     )
 
+    $command = Get-Command -Name 'Set-MpPreference' -ErrorAction SilentlyContinue
+    if ($null -eq $command -or -not $command.Parameters.ContainsKey($Property)) {
+        return
+    }
+
     $params = @{}
     $params[$Property] = $Value
     Set-MpPreference @params
+}
+
+function Get-MpPreferencePropertyRawValue {
+    param([Parameter(Mandatory)] [string]$Property)
+
+    $mp = Get-MpPreference -ErrorAction SilentlyContinue
+    if ($null -eq $mp) {
+        return $null
+    }
+
+    $propertyInfo = $mp.PSObject.Properties[$Property]
+    if ($null -eq $propertyInfo) {
+        return $null
+    }
+
+    $propertyInfo.Value
 }
 
 function Resolve-MpPreferenceValue {
@@ -695,6 +765,384 @@ function Resolve-MpPreferenceValue {
     }
 
     return $Value
+}
+
+function ConvertTo-BitLockerProtectionStatusLabel {
+    param([AllowNull()] [object]$Value)
+
+    switch ([string]$Value) {
+        '0' { 'Off' }
+        '1' { 'On' }
+        '2' { 'Unknown' }
+        'Off' { 'Off' }
+        'On' { 'On' }
+        'Unknown' { 'Unknown' }
+        default { [string]$Value }
+    }
+}
+
+function Test-BitLockerProtectionEnabled {
+    param([AllowNull()] [object]$Value)
+
+    (ConvertTo-BitLockerProtectionStatusLabel -Value $Value) -eq 'On'
+}
+
+function Get-BitLockerVolumeStates {
+    if (-not (Test-CommandAvailable -Name 'Get-BitLockerVolume')) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            Volumes          = @()
+        }
+    }
+
+    $volumes = Get-BitLockerVolume -ErrorAction SilentlyContinue
+    $states = foreach ($volume in @($volumes)) {
+        $mountPoint = if ($volume.MountPoint -is [System.Array]) {
+            [string]($volume.MountPoint | Select-Object -First 1)
+        } else {
+            [string]$volume.MountPoint
+        }
+
+        [PSCustomObject]@{
+            MountPoint           = $mountPoint
+            VolumeType           = [string]$volume.VolumeType
+            ProtectionStatus     = ConvertTo-BitLockerProtectionStatusLabel -Value $volume.ProtectionStatus
+            VolumeStatus         = [string]$volume.VolumeStatus
+            EncryptionMethod     = [string]$volume.EncryptionMethod
+            EncryptionPercentage = if ($null -ne $volume.EncryptionPercentage) { [int]$volume.EncryptionPercentage } else { $null }
+            KeyProtectorCount    = @($volume.KeyProtector).Count
+            AutoUnlockEnabled    = if ($volume.PSObject.Properties['AutoUnlockEnabled']) { [bool]$volume.AutoUnlockEnabled } else { $null }
+        }
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable = $true
+        Volumes          = @($states)
+    }
+}
+
+function Set-Permissive-BitLockerVolumes {
+    if (-not (Test-CommandAvailable -Name 'Get-BitLockerVolume') -or -not (Test-CommandAvailable -Name 'Suspend-BitLocker')) {
+        return
+    }
+
+    foreach ($volume in @(Get-BitLockerVolume -ErrorAction SilentlyContinue)) {
+        if (-not (Test-BitLockerProtectionEnabled -Value $volume.ProtectionStatus)) {
+            continue
+        }
+
+        $mountPoint = if ($volume.MountPoint -is [System.Array]) {
+            [string]($volume.MountPoint | Select-Object -First 1)
+        } else {
+            [string]$volume.MountPoint
+        }
+
+        if ([string]::IsNullOrWhiteSpace($mountPoint)) {
+            continue
+        }
+
+        Suspend-BitLocker -MountPoint $mountPoint -RebootCount 0 -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+
+function Restore-BitLockerVolumes {
+    param([Parameter(Mandatory)] [object]$State)
+
+    if (-not $State.CommandAvailable) {
+        return
+    }
+
+    if (-not (Test-CommandAvailable -Name 'Get-BitLockerVolume')) {
+        return
+    }
+
+    foreach ($volume in @($State.Volumes)) {
+        $mountPoint = [string]$volume.MountPoint
+        if ([string]::IsNullOrWhiteSpace($mountPoint)) {
+            continue
+        }
+
+        $liveVolume = Get-BitLockerVolume -MountPoint $mountPoint -ErrorAction SilentlyContinue
+        if ($null -eq $liveVolume) {
+            continue
+        }
+
+        $targetProtection = ConvertTo-BitLockerProtectionStatusLabel -Value $volume.ProtectionStatus
+        if ($targetProtection -eq 'On') {
+            if (Test-CommandAvailable -Name 'Resume-BitLocker') {
+                Resume-BitLocker -MountPoint $mountPoint -ErrorAction SilentlyContinue | Out-Null
+            }
+            continue
+        }
+
+        if (
+            $targetProtection -eq 'Off' -and
+            [string]$volume.VolumeStatus -ne 'FullyDecrypted' -and
+            [int]$volume.KeyProtectorCount -gt 0 -and
+            (Test-CommandAvailable -Name 'Suspend-BitLocker')
+        ) {
+            Suspend-BitLocker -MountPoint $mountPoint -RebootCount 0 -ErrorAction SilentlyContinue | Out-Null
+        }
+    }
+}
+
+function Get-ExploitProtectionPolicyState {
+    if (-not (Test-CommandAvailable -Name 'Get-ProcessMitigation')) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            Xml              = $null
+        }
+    }
+
+    $tempPath = New-TemporaryFilePath -Extension '.xml'
+    try {
+        Get-ProcessMitigation -RegistryConfigFilePath $tempPath | Out-Null
+        $xml = if (Test-Path -LiteralPath $tempPath) { Get-Content -LiteralPath $tempPath -Raw } else { $null }
+
+        [PSCustomObject]@{
+            CommandAvailable = $true
+            Xml              = $xml
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Normalize-ExploitProtectionXml {
+    param([AllowNull()] [string]$Xml)
+
+    if ([string]::IsNullOrWhiteSpace($Xml)) {
+        return ''
+    }
+
+    try {
+        $document = New-Object System.Xml.XmlDocument
+        $document.PreserveWhitespace = $false
+        $document.LoadXml($Xml)
+        return $document.OuterXml
+    } catch {
+        return $Xml.Trim()
+    }
+}
+
+function Apply-ExploitProtectionPolicyXml {
+    param([AllowNull()] [string]$Xml)
+
+    if ([string]::IsNullOrWhiteSpace($Xml) -or -not (Test-CommandAvailable -Name 'Set-ProcessMitigation')) {
+        return
+    }
+
+    $tempPath = New-TemporaryFilePath -Extension '.xml'
+    try {
+        [System.IO.File]::WriteAllText($tempPath, $Xml, [System.Text.UTF8Encoding]::new($false))
+        Set-ProcessMitigation -PolicyFilePath $tempPath | Out-Null
+    } finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Set-Permissive-ExploitProtection {
+    if (-not (Test-CommandAvailable -Name 'Set-ProcessMitigation')) {
+        return
+    }
+
+    try {
+        Set-ProcessMitigation -System -Reset | Out-Null
+    } catch {
+    }
+
+    foreach ($mitigation in @('DEP', 'EmulateAtlThunks', 'CFG', 'StrictCFG', 'SuppressExports', 'ForceRelocateImages', 'BottomUp', 'HighEntropy', 'SEHOP', 'SEHOPTelemetry')) {
+        try {
+            Set-ProcessMitigation -System -Disable $mitigation | Out-Null
+        } catch {
+        }
+    }
+}
+
+function Get-WdacCodeIntegrityRoot {
+    Resolve-FileSystemPath -Path (Join-Path $env:windir 'System32\CodeIntegrity')
+}
+
+function Get-WdacPolicyFileBackups {
+    $root = Get-WdacCodeIntegrityRoot
+    $files = @()
+
+    $activeDir = Join-Path $root 'CiPolicies\Active'
+    if (Test-Path -LiteralPath $activeDir) {
+        $files += @(
+            foreach ($file in @(Get-ChildItem -LiteralPath $activeDir -Filter '*.cip' -File -ErrorAction SilentlyContinue)) {
+                [PSCustomObject]@{
+                    RelativePath = Join-Path 'CiPolicies\Active' $file.Name
+                    FileName     = $file.Name
+                    Sha256       = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+                    Base64       = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($file.FullName))
+                }
+            }
+        )
+    }
+
+    $singlePolicyPath = Join-Path $root 'SiPolicy.p7b'
+    if (Test-Path -LiteralPath $singlePolicyPath) {
+        $files += [PSCustomObject]@{
+            RelativePath = 'SiPolicy.p7b'
+            FileName     = 'SiPolicy.p7b'
+            Sha256       = (Get-FileHash -LiteralPath $singlePolicyPath -Algorithm SHA256).Hash
+            Base64       = [Convert]::ToBase64String([System.IO.File]::ReadAllBytes($singlePolicyPath))
+        }
+    }
+
+    @($files)
+}
+
+function Get-WdacPolicyIdentifiers {
+    param([Parameter(Mandatory)] [object[]]$Policies)
+
+    @(
+        foreach ($policy in @($Policies)) {
+            foreach ($name in @('PolicyID', 'PolicyId', 'PolicyGuid', 'PolicyGUID', 'Id', 'ID')) {
+                $property = $policy.PSObject.Properties[$name]
+                if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                    [string]$property.Value
+                    break
+                }
+            }
+        }
+    ) | Sort-Object -Unique
+}
+
+function Get-WdacPolicyState {
+    $ciTool = Get-CiToolCommand
+    $ciToolAvailable = $null -ne $ciTool
+    $policies = @()
+
+    if ($ciToolAvailable) {
+        $json = (& $ciTool.Source -lp -json 2>$null | Out-String).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($json)) {
+            try {
+                $parsed = $json | ConvertFrom-Json
+                $policyItems = if ($parsed.PSObject.Properties['Policies']) { @($parsed.Policies) } else { @($parsed) }
+                $policies = @(
+                    foreach ($policy in @($policyItems)) {
+                        $ordered = [ordered]@{}
+                        foreach ($property in @($policy.PSObject.Properties | Sort-Object -Property Name)) {
+                            $ordered[$property.Name] = $property.Value
+                        }
+                        [PSCustomObject]$ordered
+                    }
+                )
+            } catch {
+                $policies = @()
+            }
+        }
+    }
+
+    [PSCustomObject]@{
+        CiToolAvailable = $ciToolAvailable
+        Policies        = @($policies)
+        Files           = @(Get-WdacPolicyFileBackups)
+    }
+}
+
+function Remove-WdacPolicyFiles {
+    $root = Get-WdacCodeIntegrityRoot
+    $activeDir = Join-Path $root 'CiPolicies\Active'
+    if (Test-Path -LiteralPath $activeDir) {
+        Get-ChildItem -LiteralPath $activeDir -Filter '*.cip' -File -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+
+    $singlePolicyPath = Join-Path $root 'SiPolicy.p7b'
+    if (Test-Path -LiteralPath $singlePolicyPath) {
+        Remove-Item -LiteralPath $singlePolicyPath -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-WdacPolicies {
+    param([Parameter(Mandatory)] [object]$State)
+
+    $removedWithCiTool = $false
+    $ciTool = if ($State.CiToolAvailable) { Get-CiToolCommand } else { $null }
+    if ($null -ne $ciTool) {
+        foreach ($policyId in @(Get-WdacPolicyIdentifiers -Policies @($State.Policies))) {
+            & $ciTool.Source -rp $policyId -json | Out-Null
+            if ($LASTEXITCODE -eq 0) {
+                $removedWithCiTool = $true
+            }
+        }
+
+        if ($removedWithCiTool) {
+            & $ciTool.Source -r | Out-Null
+        }
+    }
+
+    if (-not $removedWithCiTool) {
+        Remove-WdacPolicyFiles
+    }
+}
+
+function Write-WdacPolicyFiles {
+    param([Parameter(Mandatory)] [object[]]$Files)
+
+    $root = Get-WdacCodeIntegrityRoot
+    foreach ($file in @($Files)) {
+        $destination = Join-Path $root ([string]$file.RelativePath)
+        Write-BytesAtomic -Path $destination -Content ([Convert]::FromBase64String([string]$file.Base64))
+    }
+}
+
+function Restore-WdacPolicyFiles {
+    param([Parameter(Mandatory)] [object[]]$Files)
+
+    Remove-WdacPolicyFiles
+    Write-WdacPolicyFiles -Files $Files
+}
+
+function Restore-WdacPolicies {
+    param([Parameter(Mandatory)] [object]$State)
+
+    $liveState = Get-WdacPolicyState
+    Remove-WdacPolicies -State $liveState
+
+    $files = @($State.Files)
+    if ($files.Count -eq 0) {
+        return
+    }
+
+    $ciPolicyFiles = @($files | Where-Object { ([string]$_.FileName).ToLowerInvariant().EndsWith('.cip') })
+    $singlePolicyFiles = @($files | Where-Object { ([string]$_.FileName) -eq 'SiPolicy.p7b' })
+
+    $ciTool = if ($State.CiToolAvailable) { Get-CiToolCommand } else { $null }
+    if ($null -ne $ciTool) {
+        foreach ($file in $ciPolicyFiles) {
+            $tempPath = New-TemporaryFilePath -Extension '.cip'
+            try {
+                [System.IO.File]::WriteAllBytes($tempPath, [Convert]::FromBase64String([string]$file.Base64))
+                & $ciTool.Source -up $tempPath -json | Out-Null
+                if ($LASTEXITCODE -ne 0) {
+                    throw "CiTool failed to restore WDAC policy from $tempPath"
+                }
+            } finally {
+                if (Test-Path -LiteralPath $tempPath) {
+                    Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+
+        if ($ciPolicyFiles.Count -gt 0) {
+            & $ciTool.Source -r | Out-Null
+        }
+
+        if ($singlePolicyFiles.Count -gt 0) {
+            Write-WdacPolicyFiles -Files @($singlePolicyFiles)
+        }
+        return
+    }
+
+    Restore-WdacPolicyFiles -Files $files
 }
 
 function Get-AuditPolicyState {
@@ -930,6 +1378,34 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Current value' -Value $Entry.CurrentValue
             Add-ReportKeyValueLine -Lines $Lines -Label 'Restore value' -Value $Entry.RestoreValue
         }
+        'BitLockerVolumes' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $Entry.CurrentValue.CommandAvailable
+            foreach ($volume in @($Entry.CurrentValue.Volumes)) {
+                $Lines.Add(('  - {0} | Protection={1} | Status={2} | Encryption={3}% | Protectors={4}' -f $volume.MountPoint, $volume.ProtectionStatus, $volume.VolumeStatus, $volume.EncryptionPercentage, $volume.KeyProtectorCount))
+            }
+        }
+        'ExploitProtectionPolicy' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $Entry.CurrentValue.CommandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'XML captured' -Value (-not [string]::IsNullOrWhiteSpace([string]$Entry.CurrentValue.Xml))
+        }
+        'WdacPolicies' {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'CiTool available' -Value $Entry.CurrentValue.CiToolAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Policy count' -Value @($Entry.CurrentValue.Policies).Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Policy file count' -Value @($Entry.CurrentValue.Files).Count
+            foreach ($policy in @($Entry.CurrentValue.Policies)) {
+                $policyId = $null
+                foreach ($name in @('PolicyID', 'PolicyId', 'PolicyGuid', 'PolicyGUID', 'Id', 'ID')) {
+                    $property = $policy.PSObject.Properties[$name]
+                    if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
+                        $policyId = [string]$property.Value
+                        break
+                    }
+                }
+
+                $friendlyName = if ($policy.PSObject.Properties['FriendlyName']) { [string]$policy.FriendlyName } else { '<unknown>' }
+                $Lines.Add(('  - {0} | {1}' -f $policyId, $friendlyName))
+            }
+        }
         'AsrRules' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Configured rule count' -Value @($Entry.CurrentValue).Count
             foreach ($rule in @($Entry.CurrentValue)) {
@@ -1055,6 +1531,66 @@ function ConvertTo-ComparableSnapshotEntry {
                 Type           = $Entry.Type
                 Property       = $Entry.Property
                 RestoreValue   = $Entry.RestoreValue
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'BitLockerVolumes' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = [ordered]@{
+                    CommandAvailable = $Entry.CurrentValue.CommandAvailable
+                    Volumes          = @(
+                        foreach ($volume in @($Entry.CurrentValue.Volumes)) {
+                            [PSCustomObject]@{
+                                MountPoint           = [string]$volume.MountPoint
+                                ProtectionStatus     = [string]$volume.ProtectionStatus
+                                VolumeStatus         = [string]$volume.VolumeStatus
+                                EncryptionPercentage = $volume.EncryptionPercentage
+                                KeyProtectorCount    = $volume.KeyProtectorCount
+                            }
+                        }
+                    )
+                }
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'ExploitProtectionPolicy' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = [ordered]@{
+                    CommandAvailable = $Entry.CurrentValue.CommandAvailable
+                    Xml              = Normalize-ExploitProtectionXml -Xml ([string]$Entry.CurrentValue.Xml)
+                }
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'WdacPolicies' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = [ordered]@{
+                    CiToolAvailable = $Entry.CurrentValue.CiToolAvailable
+                    Policies        = @(
+                        foreach ($policy in @($Entry.CurrentValue.Policies)) {
+                            $ordered = [ordered]@{}
+                            foreach ($property in @($policy.PSObject.Properties | Sort-Object -Property Name)) {
+                                $ordered[$property.Name] = $property.Value
+                            }
+                            [PSCustomObject]$ordered
+                        }
+                    )
+                    Files           = @(
+                        foreach ($file in @($Entry.CurrentValue.Files)) {
+                            [PSCustomObject]@{
+                                RelativePath = [string]$file.RelativePath
+                                FileName     = [string]$file.FileName
+                                Sha256       = [string]$file.Sha256
+                            }
+                        }
+                    )
+                }
                 RequiresReboot = $Entry.RequiresReboot
             })
         }
@@ -1271,6 +1807,13 @@ function Get-DefenseDefinitions {
 
     @(
         [PSCustomObject]@{ Id = 'defender.disable_realtime_monitoring'; Type = 'MpPreferenceValue'; Property = 'DisableRealtimeMonitoring'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.disable_behavior_monitoring'; Type = 'MpPreferenceValue'; Property = 'DisableBehaviorMonitoring'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.maps_reporting'; Type = 'MpPreferenceValue'; Property = 'MAPSReporting'; PermissiveValue = 'Disabled'; ValueMap = @{ '0' = 'Disabled'; '1' = 'Basic'; '2' = 'Advanced' }; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.submit_samples_consent'; Type = 'MpPreferenceValue'; Property = 'SubmitSamplesConsent'; PermissiveValue = 'NeverSend'; ValueMap = @{ '0' = 'AlwaysPrompt'; '1' = 'SendSafeSamples'; '2' = 'NeverSend'; '3' = 'SendAllSamples' }; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.pua_protection'; Type = 'MpPreferenceValue'; Property = 'PUAProtection'; PermissiveValue = 'Disabled'; ValueMap = @{ '0' = 'Disabled'; '1' = 'Enabled'; '2' = 'AuditMode' }; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.disable_script_scanning'; Type = 'MpPreferenceValue'; Property = 'DisableScriptScanning'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.disable_ioav_protection'; Type = 'MpPreferenceValue'; Property = 'DisableIOAVProtection'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.disable_intrusion_prevention_system'; Type = 'MpPreferenceValue'; Property = 'DisableIntrusionPreventionSystem'; PermissiveValue = $true; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'defender.enable_network_protection'; Type = 'MpPreferenceValue'; Property = 'EnableNetworkProtection'; PermissiveValue = 'Disabled'; ValueMap = @{ '0' = 'Disabled'; '1' = 'Enabled'; '2' = 'AuditMode' }; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'defender.enable_controlled_folder_access'; Type = 'MpPreferenceValue'; Property = 'EnableControlledFolderAccess'; PermissiveValue = 'Disabled'; ValueMap = @{ '0' = 'Disabled'; '1' = 'Enabled'; '2' = 'AuditMode' }; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'defender.asr_rules'; Type = 'AsrRules'; RequiresReboot = $false }
@@ -1295,6 +1838,7 @@ function Get-DefenseDefinitions {
         [PSCustomObject]@{ Id = 'wsh.enabled'; Type = 'RegistryValue'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings'; Name = 'Enabled'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 1; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'smartscreen.enable'; Type = 'RegistryValue'; Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name = 'EnableSmartScreen'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'sehop.disable_exception_chain_validation'; Type = 'RegistryValue'; Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\kernel'; Name = 'DisableExceptionChainValidation'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 1; RequiresReboot = $true }
+        [PSCustomObject]@{ Id = 'exploit_protection.policy'; Type = 'ExploitProtectionPolicy'; RequiresReboot = $true }
 
         [PSCustomObject]@{ Id = 'lsa.run_as_ppl'; Type = 'RegistryValue'; Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'RunAsPPL'; ValueKind = 'DWord'; PermissiveExists = $false; PermissiveValue = $null; RequiresReboot = $true }
         [PSCustomObject]@{ Id = 'lsa.no_lm_hash'; Type = 'RegistryValue'; Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Lsa'; Name = 'NoLMHash'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $true }
@@ -1324,6 +1868,8 @@ function Get-DefenseDefinitions {
 
         [PSCustomObject]@{ Id = 'smb.client.require_security_signature'; Type = 'SmbClientConfig'; PermissiveValue = $false; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'smb.server.require_security_signature'; Type = 'SmbServerConfig'; PermissiveValue = $false; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'bitlocker.volumes'; Type = 'BitLockerVolumes'; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'wdac.policies'; Type = 'WdacPolicies'; RequiresReboot = $true }
         [PSCustomObject]@{ Id = 'office.block_macros_from_internet'; Type = 'LoadedUserRegistryValues'; Items = @($officeMacroItems); RequiresReboot = $false }
     )
 }
@@ -1356,8 +1902,7 @@ function Capture-Definition {
             return Capture-RegistryKeyFlatState -Id $Definition.Id -Path $Definition.Path -RequiresReboot $Definition.RequiresReboot
         }
         'MpPreferenceValue' {
-            $mp = Get-MpPreference -ErrorAction SilentlyContinue
-            $rawValue = if ($null -ne $mp) { $mp.($Definition.Property) } else { $null }
+            $rawValue = Get-MpPreferencePropertyRawValue -Property $Definition.Property
 
             return [PSCustomObject]@{
                 Id             = $Definition.Id
@@ -1365,6 +1910,30 @@ function Capture-Definition {
                 Property       = $Definition.Property
                 CurrentValue   = $rawValue
                 RestoreValue   = Resolve-MpPreferenceValue -Definition $Definition -Value $rawValue
+                RequiresReboot = $Definition.RequiresReboot
+            }
+        }
+        'BitLockerVolumes' {
+            return [PSCustomObject]@{
+                Id             = $Definition.Id
+                Type           = 'BitLockerVolumes'
+                CurrentValue   = Get-BitLockerVolumeStates
+                RequiresReboot = $Definition.RequiresReboot
+            }
+        }
+        'ExploitProtectionPolicy' {
+            return [PSCustomObject]@{
+                Id             = $Definition.Id
+                Type           = 'ExploitProtectionPolicy'
+                CurrentValue   = Get-ExploitProtectionPolicyState
+                RequiresReboot = $Definition.RequiresReboot
+            }
+        }
+        'WdacPolicies' {
+            return [PSCustomObject]@{
+                Id             = $Definition.Id
+                Type           = 'WdacPolicies'
+                CurrentValue   = Get-WdacPolicyState
                 RequiresReboot = $Definition.RequiresReboot
             }
         }
@@ -1505,6 +2074,15 @@ function Apply-PermissiveDefinition {
         'MpPreferenceValue' {
             Set-MpPreferencePropertyValue -Property $Definition.Property -Value $Definition.PermissiveValue
         }
+        'BitLockerVolumes' {
+            Set-Permissive-BitLockerVolumes
+        }
+        'ExploitProtectionPolicy' {
+            Set-Permissive-ExploitProtection
+        }
+        'WdacPolicies' {
+            Remove-WdacPolicies -State (Get-WdacPolicyState)
+        }
         'AsrRules' {
             Disable-ConfiguredAsrRules
         }
@@ -1570,6 +2148,15 @@ function Restore-SnapshotEntry {
         }
         'MpPreferenceValue' {
             Set-MpPreferencePropertyValue -Property $Entry.Property -Value $Entry.RestoreValue
+        }
+        'BitLockerVolumes' {
+            Restore-BitLockerVolumes -State $Entry.CurrentValue
+        }
+        'ExploitProtectionPolicy' {
+            Apply-ExploitProtectionPolicyXml -Xml ([string]$Entry.CurrentValue.Xml)
+        }
+        'WdacPolicies' {
+            Restore-WdacPolicies -State $Entry.CurrentValue
         }
         'AsrRules' {
             Restore-AsrRules -Rules @($Entry.CurrentValue)
