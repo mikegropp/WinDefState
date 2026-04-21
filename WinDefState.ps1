@@ -1480,7 +1480,7 @@ function Apply-ExploitProtectionPolicyXml {
     }
 }
 
-function Set-Permissive-ExploitProtection {
+function Reset-ExploitProtectionSystemConfig {
     if (-not (Test-CommandAvailable -Name 'Set-ProcessMitigation')) {
         return
     }
@@ -1489,6 +1489,10 @@ function Set-Permissive-ExploitProtection {
         Set-ProcessMitigation -System -Reset | Out-Null
     } catch {
     }
+}
+
+function Set-Permissive-ExploitProtection {
+    Reset-ExploitProtectionSystemConfig
 
     foreach ($mitigation in @('DEP', 'EmulateAtlThunks', 'CFG', 'StrictCFG', 'SuppressExports', 'ForceRelocateImages', 'BottomUp', 'HighEntropy', 'SEHOP', 'SEHOPTelemetry')) {
         try {
@@ -3217,6 +3221,9 @@ function Restore-SnapshotEntry {
             Restore-BitLockerVolumes -State $Entry.CurrentValue
         }
         'ExploitProtectionPolicy' {
+            # Reset lingering system mitigation state first because PolicyFilePath import
+            # does not reliably clear permissive-era SystemConfig entries on its own.
+            Reset-ExploitProtectionSystemConfig
             Apply-ExploitProtectionPolicyXml -Xml (Get-ExploitProtectionPolicyXml -State $Entry.CurrentValue -SnapshotPath $SnapshotPath)
         }
         'WdacPolicies' {
