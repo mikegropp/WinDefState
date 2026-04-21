@@ -933,7 +933,7 @@ if (`$null -eq `$volume) {
 
         if ($result.ExitCode -ne 0) {
             if (-not [string]::IsNullOrWhiteSpace([string]$result.StdErr)) {
-                Write-Warning "BitLocker snapshot failed on mount point $mountPoint: $($result.StdErr.Trim())"
+                Write-Warning ("BitLocker snapshot failed on mount point {0}: {1}" -f $mountPoint, $result.StdErr.Trim())
             }
             continue
         }
