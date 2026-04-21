@@ -1595,6 +1595,88 @@ function Get-WdacPolicyIdFromFileName {
     return $null
 }
 
+function Get-WdacPolicyPlatformManagementInfo {
+    param([Parameter(Mandatory)] [object]$Policy)
+
+    $policyId = Get-WdacPolicyIdentifierFromObject -Policy $Policy
+    $normalizedPolicyId = Get-WdacNormalizedPolicyId -Value $policyId
+    $friendlyName = if (
+        $Policy.PSObject.Properties['FriendlyName'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Policy.FriendlyName)
+    ) {
+        [string]$Policy.FriendlyName
+    } else {
+        '<unknown>'
+    }
+
+    $platformPolicy = $null
+    foreach ($propertyName in @('Platform Policy', 'PlatformPolicy')) {
+        if ($Policy.PSObject.Properties[$propertyName]) {
+            $platformPolicy = ConvertTo-NullableBoolean -Value $Policy.PSObject.Properties[$propertyName].Value
+            if ($null -ne $platformPolicy) {
+                break
+            }
+        }
+    }
+
+    $knownInboxPolicies = @{
+        '0283ac0f-fff1-49ae-ada1-8a933130cad6' = 'Inbox Smart App Control base policy'
+        '1283ac0f-fff1-49ae-ada1-8a933130cad6' = 'Inbox Smart App Control evaluation base policy'
+        '1678656c-05ef-481f-bc5b-ebd8c991502d' = 'Inbox Smart App Control flight supplemental policy'
+        '2678656c-05ef-481f-bc5b-ebd8c991502d' = 'Inbox Smart App Control evaluation flight supplemental policy'
+        '0939ed82-bfd5-4d32-b58e-d31d3c49715a' = 'Inbox Smart App Control test supplemental policy'
+        '1939ed82-bfd5-4d32-b58e-d31d3c49715a' = 'Inbox Smart App Control evaluation test supplemental policy'
+        'd2bda982-ccf6-4344-ac5b-0b44427b6816' = 'Inbox Microsoft Windows Driver Policy'
+        'a072029f-588b-4b5e-b7f9-05aad67df687' = 'Inbox Microsoft Windows Virtualization Based Security policy'
+        '82443e1e-8a39-4b4a-96a8-f40ddc00b9f3' = 'Inbox Windows 11 SE lockdown base policy'
+        '5dac656c-21ad-4a02-ab49-649917162e70' = 'Inbox Windows 11 SE flight supplemental policy'
+        'cdd5cb55-db68-4d71-aa38-3df2b6473a52' = 'Inbox Windows 11 SE test supplemental policy'
+        '5951a96a-e0b5-4d3d-8fb8-3e5b61030784' = 'Inbox Windows 10 S lockdown base policy'
+        '784c4414-79f4-4c32-a6a5-f0fb42a51d0d' = 'Inbox Microsoft Code Integrity cross-certificates exception policy'
+    }
+
+    $classification = $null
+    if (-not [string]::IsNullOrWhiteSpace($normalizedPolicyId) -and $knownInboxPolicies.ContainsKey($normalizedPolicyId)) {
+        $classification = $knownInboxPolicies[$normalizedPolicyId]
+    } elseif ($friendlyName -match '^VerifiedAndReputableDesktop') {
+        $classification = 'Inbox Smart App Control policy'
+    } elseif ($friendlyName -eq 'Microsoft Windows Driver Policy') {
+        $classification = 'Inbox Microsoft Windows Driver Policy'
+    } elseif ($friendlyName -eq 'Microsoft Windows Virtualization Based Security Policy') {
+        $classification = 'Inbox Microsoft Windows Virtualization Based Security policy'
+    } elseif ($friendlyName -match '^Windows(E|10S)_Lockdown') {
+        $classification = 'Inbox Windows lockdown policy'
+    } elseif ($platformPolicy -eq $true) {
+        $classification = 'Platform-managed WDAC policy'
+    }
+
+    [PSCustomObject]@{
+        PolicyId           = $policyId
+        FriendlyName       = $friendlyName
+        NormalizedPolicyId = $normalizedPolicyId
+        PlatformPolicy     = $platformPolicy
+        IsPlatformManaged  = -not [string]::IsNullOrWhiteSpace([string]$classification)
+        Classification     = $classification
+    }
+}
+
+function Get-WdacPlatformManagedPolicies {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State -or -not $State.PSObject.Properties['Policies']) {
+        return @()
+    }
+
+    @(
+        foreach ($policy in @($State.Policies)) {
+            $info = Get-WdacPolicyPlatformManagementInfo -Policy $policy
+            if ($info.IsPlatformManaged) {
+                $info
+            }
+        }
+    )
+}
+
 function Test-WdacPolicyRemovalCandidate {
     param([Parameter(Mandatory)] [object]$Policy)
 
@@ -2150,24 +2232,28 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'CiTool available' -Value $Entry.CurrentValue.CiToolAvailable
             Add-ReportKeyValueLine -Lines $Lines -Label 'Policy count' -Value @($Entry.CurrentValue.Policies).Count
             Add-ReportKeyValueLine -Lines $Lines -Label 'Policy file count' -Value @($Entry.CurrentValue.Files).Count
+            $platformManagedPolicies = @(Get-WdacPlatformManagedPolicies -State $Entry.CurrentValue)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Platform-managed policy count' -Value $platformManagedPolicies.Count
+            if ($platformManagedPolicies.Count -gt 0) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'Inbox or platform-managed WDAC policies are tracked for state awareness, but they may require file-based handling or a reboot and may not behave like ordinary custom WDAC policies during testing.'
+            }
             foreach ($policy in @($Entry.CurrentValue.Policies)) {
-                $policyId = $null
-                foreach ($name in @('PolicyID', 'PolicyId', 'PolicyGuid', 'PolicyGUID', 'Id', 'ID')) {
-                    $property = $policy.PSObject.Properties[$name]
-                    if ($null -ne $property -and -not [string]::IsNullOrWhiteSpace([string]$property.Value)) {
-                        $policyId = [string]$property.Value
-                        break
-                    }
+                $policyInfo = Get-WdacPolicyPlatformManagementInfo -Policy $policy
+                if ($policyInfo.IsPlatformManaged) {
+                    $Lines.Add(('  - {0} | {1} | {2} [platform-managed]' -f $policyInfo.PolicyId, $policyInfo.FriendlyName, $policyInfo.Classification))
+                } else {
+                    $Lines.Add(('  - {0} | {1}' -f $policyInfo.PolicyId, $policyInfo.FriendlyName))
                 }
-
-                $friendlyName = if ($policy.PSObject.Properties['FriendlyName']) { [string]$policy.FriendlyName } else { '<unknown>' }
-                $Lines.Add(('  - {0} | {1}' -f $policyId, $friendlyName))
             }
         }
         'AsrRules' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Configured rule count' -Value @($Entry.CurrentValue).Count
             $invalidEntries = @(Get-AsrInvalidEntriesFromEntry -Entry $Entry)
             Add-ReportKeyValueLine -Lines $Lines -Label 'Invalid capture entry count' -Value $invalidEntries.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($invalidEntries.Count -eq 0) { 'Complete' } else { 'Partial / incomplete' })
+            if ($invalidEntries.Count -gt 0) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'This snapshot did not capture a reliable ASR baseline. Permissive, restore, and verification will skip ASR changes to avoid unsafe round-trip behavior.'
+            }
             foreach ($rule in @($Entry.CurrentValue)) {
                 $Lines.Add(('  - {0} | {1} | {2}' -f $rule.Id, $rule.Name, $rule.ActionLabel))
             }
@@ -2250,6 +2336,12 @@ function Get-SnapshotReportLines {
 
     $lines = [System.Collections.Generic.List[string]]::new()
     $settings = @($Snapshot.Settings)
+    $incompleteBaselineCount = @($settings | Where-Object { -not (Test-SnapshotEntryCapturedExactly -Entry $_ -SnapshotPath $SnapshotPath) }).Count
+    $platformManagedWdacCount = 0
+    $wdacEntry = @($settings | Where-Object { [string]$_.Type -eq 'WdacPolicies' } | Select-Object -First 1)
+    if ($wdacEntry.Count -gt 0) {
+        $platformManagedWdacCount = @(Get-WdacPlatformManagedPolicies -State $wdacEntry[0].CurrentValue).Count
+    }
 
     $lines.Add('WinDefState Snapshot Report')
     $lines.Add(('Snapshot JSON: {0}' -f $SnapshotPath))
@@ -2257,6 +2349,8 @@ function Get-SnapshotReportLines {
     $lines.Add(('CapturedAtUtc: {0}' -f $Snapshot.CapturedAtUtc))
     $lines.Add(('Settings captured: {0}' -f $settings.Count))
     $lines.Add(('Reboot-required settings: {0}' -f (@($settings | Where-Object { $_.RequiresReboot }).Count)))
+    $lines.Add(('Incomplete-baseline settings: {0}' -f $incompleteBaselineCount))
+    $lines.Add(('Platform-managed WDAC policies: {0}' -f $platformManagedWdacCount))
 
     foreach ($entry in $settings) {
         $lines.Add(' ')
