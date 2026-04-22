@@ -298,6 +298,15 @@ function Get-VerificationReportPath {
     Join-Path $verificationDir "$baseName-restore-check-$(Get-Date -Format 'yyyyMMdd-HHmmss').txt"
 }
 
+function Get-WdacVerificationReportPath {
+    param([Parameter(Mandatory)] [string]$VerificationPath)
+
+    $fullPath = [IO.Path]::GetFullPath($VerificationPath)
+    $parent = Split-Path -Parent $fullPath
+    $baseName = [IO.Path]::GetFileNameWithoutExtension($fullPath)
+    Join-Path $parent ($baseName + '-wdac.txt')
+}
+
 function Get-OperationPath {
     param([Parameter(Mandatory)] [string]$Root)
 
@@ -483,49 +492,292 @@ function Get-LoadedUserSids {
     @($sids)
 }
 
+function Get-UserProfileRegistryTargets {
+    $targetsBySid = @{}
+    $loadedSidSet = @{}
+
+    foreach ($sid in @(Get-LoadedUserSids)) {
+        $loadedSidSet[[string]$sid] = $true
+    }
+
+    if (Test-CommandAvailable -Name 'Get-CimInstance') {
+        try {
+            foreach ($profile in @(Get-CimInstance -ClassName Win32_UserProfile -ErrorAction Stop)) {
+                $sid = if ($null -ne $profile.PSObject.Properties['SID']) { [string]$profile.SID } else { '' }
+                if ([string]::IsNullOrWhiteSpace($sid) -or $sid -notmatch '^S-\d-\d+-.+') {
+                    continue
+                }
+
+                $isSpecial = $false
+                if ($null -ne $profile.PSObject.Properties['Special'] -and $null -ne $profile.Special) {
+                    $isSpecial = [bool]$profile.Special
+                }
+
+                if ($isSpecial) {
+                    continue
+                }
+
+                $profilePath = $null
+                if ($null -ne $profile.PSObject.Properties['LocalPath'] -and -not [string]::IsNullOrWhiteSpace([string]$profile.LocalPath)) {
+                    $profilePath = Resolve-FileSystemPath -Path ([string]$profile.LocalPath)
+                }
+
+                $targetsBySid[$sid] = [PSCustomObject]@{
+                    Sid         = $sid
+                    ProfilePath = $profilePath
+                    HivePath    = if (-not [string]::IsNullOrWhiteSpace($profilePath)) { Join-Path $profilePath 'NTUSER.DAT' } else { $null }
+                    Loaded      = ($loadedSidSet.ContainsKey($sid) -or ($null -ne $profile.PSObject.Properties['Loaded'] -and [bool]$profile.Loaded))
+                }
+            }
+        } catch {
+            Write-Verbose ("Failed to enumerate Win32_UserProfile instances: {0}" -f $_.Exception.Message)
+        }
+    }
+
+    foreach ($profileKey in @(Get-ChildItem -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList' -ErrorAction SilentlyContinue)) {
+        $sid = [string]$profileKey.PSChildName
+        if ([string]::IsNullOrWhiteSpace($sid) -or $sid -notmatch '^S-\d-\d+-.+') {
+            continue
+        }
+
+        if ($targetsBySid.ContainsKey($sid)) {
+            continue
+        }
+
+        $profilePath = $null
+        $properties = Get-ItemProperty -Path $profileKey.PSPath -Name 'ProfileImagePath' -ErrorAction SilentlyContinue
+        if ($null -ne $properties -and -not [string]::IsNullOrWhiteSpace([string]$properties.ProfileImagePath)) {
+            $profilePath = Resolve-FileSystemPath -Path ([string]$properties.ProfileImagePath)
+        }
+
+        $targetsBySid[$sid] = [PSCustomObject]@{
+            Sid         = $sid
+            ProfilePath = $profilePath
+            HivePath    = if (-not [string]::IsNullOrWhiteSpace($profilePath)) { Join-Path $profilePath 'NTUSER.DAT' } else { $null }
+            Loaded      = $loadedSidSet.ContainsKey($sid)
+        }
+    }
+
+    foreach ($sid in @($loadedSidSet.Keys)) {
+        if ($targetsBySid.ContainsKey($sid)) {
+            continue
+        }
+
+        $targetsBySid[$sid] = [PSCustomObject]@{
+            Sid         = $sid
+            ProfilePath = $null
+            HivePath    = $null
+            Loaded      = $true
+        }
+    }
+
+    @(
+        foreach ($entry in @($targetsBySid.GetEnumerator() | Sort-Object -Property Name)) {
+            $entry.Value
+        }
+    )
+}
+
+function Open-UserRegistryTarget {
+    param([Parameter(Mandatory)] [object]$Target)
+
+    $sid = [string]$Target.Sid
+    if ([string]::IsNullOrWhiteSpace($sid)) {
+        throw 'User registry target SID is missing.'
+    }
+
+    $loadedRootPath = "Registry::HKEY_USERS\$sid"
+    if (Test-Path -LiteralPath $loadedRootPath) {
+        return [PSCustomObject]@{
+            Sid           = $sid
+            ProfilePath   = if ($null -ne $Target.PSObject.Properties['ProfilePath']) { [string]$Target.ProfilePath } else { $null }
+            HivePath      = if ($null -ne $Target.PSObject.Properties['HivePath']) { [string]$Target.HivePath } else { $null }
+            RootPath      = $loadedRootPath
+            MountName     = $sid
+            MountedByTool = $false
+        }
+    }
+
+    $hivePath = if ($null -ne $Target.PSObject.Properties['HivePath']) { [string]$Target.HivePath } else { $null }
+    if ([string]::IsNullOrWhiteSpace($hivePath)) {
+        throw ("User profile hive path is unavailable for SID {0}." -f $sid)
+    }
+
+    if (-not (Test-Path -LiteralPath $hivePath)) {
+        throw ("User profile hive file was not found for SID {0} at {1}." -f $sid, $hivePath)
+    }
+
+    $mountName = "WinDefState_{0}" -f ([guid]::NewGuid().ToString('N'))
+    $loadOutput = & reg.exe load "HKU\$mountName" $hivePath 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $message = (@($loadOutput | ForEach-Object { $_.ToString().Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' ').Trim()
+        if ([string]::IsNullOrWhiteSpace($message)) {
+            $message = "reg.exe load failed with exit code $LASTEXITCODE."
+        }
+
+        throw ("Failed to load user hive for SID {0} from {1}. {2}" -f $sid, $hivePath, $message)
+    }
+
+    [PSCustomObject]@{
+        Sid           = $sid
+        ProfilePath   = if ($null -ne $Target.PSObject.Properties['ProfilePath']) { [string]$Target.ProfilePath } else { $null }
+        HivePath      = $hivePath
+        RootPath      = "Registry::HKEY_USERS\$mountName"
+        MountName     = $mountName
+        MountedByTool = $true
+    }
+}
+
+function Close-UserRegistryTarget {
+    param([AllowNull()] [object]$Target)
+
+    if ($null -eq $Target) {
+        return
+    }
+
+    $mountedByTool = $false
+    if ($null -ne $Target.PSObject.Properties['MountedByTool'] -and $Target.MountedByTool) {
+        $mountedByTool = $true
+    }
+
+    if (-not $mountedByTool) {
+        return
+    }
+
+    $mountName = if ($null -ne $Target.PSObject.Properties['MountName']) { [string]$Target.MountName } else { $null }
+    if ([string]::IsNullOrWhiteSpace($mountName)) {
+        return
+    }
+
+    $unloadOutput = & reg.exe unload "HKU\$mountName" 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        $message = (@($unloadOutput | ForEach-Object { $_.ToString().Trim() } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }) -join ' ').Trim()
+        if ([string]::IsNullOrWhiteSpace($message)) {
+            $message = "reg.exe unload failed with exit code $LASTEXITCODE."
+        }
+
+        Write-Warning ("Failed to unload temporary user hive mount HKU\{0} for SID {1}. {2}" -f $mountName, ([string]$Target.Sid), $message)
+    }
+}
+
+function New-UserRegistryCaptureIssue {
+    param(
+        [Parameter(Mandatory)] [string]$Sid,
+        [string]$ProfilePath,
+        [string]$HivePath,
+        [Parameter(Mandatory)] [string]$Message
+    )
+
+    [PSCustomObject]@{
+        Sid         = $Sid
+        ProfilePath = $ProfilePath
+        HivePath    = $HivePath
+        Message     = $Message
+    }
+}
+
+function Normalize-UserRegistryValueState {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State) {
+        return [PSCustomObject]@{
+            Entries       = @()
+            CaptureIssues = @()
+        }
+    }
+
+    $entries = @()
+    $captureIssues = @()
+
+    if ($null -ne $State.PSObject.Properties['Entries']) {
+        $entries = @($State.Entries)
+    } else {
+        $entries = @($State)
+    }
+
+    if ($null -ne $State.PSObject.Properties['CaptureIssues']) {
+        $captureIssues = @($State.CaptureIssues)
+    }
+
+    [PSCustomObject]@{
+        Entries       = @($entries)
+        CaptureIssues = @($captureIssues)
+    }
+}
+
 function Get-LoadedUserRegistryValueStates {
     param([Parameter(Mandatory)] [object[]]$Items)
 
     $entries = @()
+    $captureIssues = @()
 
-    foreach ($sid in @(Get-LoadedUserSids)) {
-        foreach ($item in @($Items)) {
-            $path = "Registry::HKEY_USERS\$sid\$($item.RelativePath)"
-            $property = Get-ItemProperty -Path $path -Name $item.Name -ErrorAction SilentlyContinue
-            $exists = $null -ne $property -and $null -ne $property.$($item.Name)
-            $kind = if ($exists) {
-                try { (Get-Item -Path $path).GetValueKind($item.Name).ToString() } catch { $item.ValueKind }
-            } else {
-                $item.ValueKind
-            }
+    foreach ($target in @(Get-UserProfileRegistryTargets)) {
+        $access = $null
 
-            $entries += [PSCustomObject]@{
-                Sid          = $sid
-                RelativePath = $item.RelativePath
-                Name         = $item.Name
-                Exists       = $exists
-                CurrentValue = if ($exists) { $property.$($item.Name) } else { $null }
-                ValueKind    = $kind
+        try {
+            $access = Open-UserRegistryTarget -Target $target
+
+            foreach ($item in @($Items)) {
+                $path = "$($access.RootPath)\$($item.RelativePath)"
+                $property = Get-ItemProperty -Path $path -Name $item.Name -ErrorAction SilentlyContinue
+                $exists = $null -ne $property -and $null -ne $property.$($item.Name)
+                $kind = if ($exists) {
+                    try { (Get-Item -Path $path).GetValueKind($item.Name).ToString() } catch { $item.ValueKind }
+                } else {
+                    $item.ValueKind
+                }
+
+                $entries += [PSCustomObject]@{
+                    Sid          = [string]$target.Sid
+                    ProfilePath  = if ($null -ne $target.PSObject.Properties['ProfilePath']) { [string]$target.ProfilePath } else { $null }
+                    HivePath     = if ($null -ne $access.PSObject.Properties['HivePath']) { [string]$access.HivePath } else { $null }
+                    RelativePath = $item.RelativePath
+                    Name         = $item.Name
+                    Exists       = $exists
+                    CurrentValue = if ($exists) { $property.$($item.Name) } else { $null }
+                    ValueKind    = $kind
+                }
             }
+        } catch {
+            $message = $_.Exception.Message
+            $profilePath = if ($null -ne $target.PSObject.Properties['ProfilePath']) { [string]$target.ProfilePath } else { $null }
+            $hivePath = if ($null -ne $target.PSObject.Properties['HivePath']) { [string]$target.HivePath } else { $null }
+            $captureIssues += New-UserRegistryCaptureIssue -Sid ([string]$target.Sid) -ProfilePath $profilePath -HivePath $hivePath -Message $message
+            Write-Warning ("Failed to capture user-scoped registry values for SID {0}: {1}" -f ([string]$target.Sid), $message)
+        } finally {
+            Close-UserRegistryTarget -Target $access
         }
     }
 
-    @($entries)
+    [PSCustomObject]@{
+        Entries       = @($entries)
+        CaptureIssues = @($captureIssues)
+    }
 }
 
 function Set-Permissive-LoadedUserRegistryValues {
     param([Parameter(Mandatory)] [object[]]$Items)
 
-    foreach ($sid in @(Get-LoadedUserSids)) {
-        foreach ($item in @($Items)) {
-            $path = "Registry::HKEY_USERS\$sid\$($item.RelativePath)"
+    foreach ($target in @(Get-UserProfileRegistryTargets)) {
+        $access = $null
 
-            if ($item.PermissiveExists) {
-                Ensure-RegistryPath -Path $path
-                New-ItemProperty -Path $path -Name $item.Name -PropertyType $item.ValueKind -Value $item.PermissiveValue -Force | Out-Null
-            } else {
-                Remove-ItemProperty -Path $path -Name $item.Name -ErrorAction SilentlyContinue
+        try {
+            $access = Open-UserRegistryTarget -Target $target
+
+            foreach ($item in @($Items)) {
+                $path = "$($access.RootPath)\$($item.RelativePath)"
+
+                if ($item.PermissiveExists) {
+                    Ensure-RegistryPath -Path $path
+                    New-ItemProperty -Path $path -Name $item.Name -PropertyType $item.ValueKind -Value $item.PermissiveValue -Force | Out-Null
+                } else {
+                    Remove-ItemProperty -Path $path -Name $item.Name -ErrorAction SilentlyContinue
+                }
             }
+        } catch {
+            Write-Warning ("Failed to set permissive user-scoped registry values for SID {0}: {1}" -f ([string]$target.Sid), $_.Exception.Message)
+        } finally {
+            Close-UserRegistryTarget -Target $access
         }
     }
 }
@@ -533,14 +785,48 @@ function Set-Permissive-LoadedUserRegistryValues {
 function Restore-LoadedUserRegistryValues {
     param([Parameter(Mandatory)] [object[]]$Entries)
 
-    foreach ($entry in @($Entries)) {
-        $path = "Registry::HKEY_USERS\$($entry.Sid)\$($entry.RelativePath)"
+    $targetsBySid = @{}
+    foreach ($target in @(Get-UserProfileRegistryTargets)) {
+        $targetsBySid[[string]$target.Sid] = $target
+    }
 
-        if ($entry.Exists) {
-            Ensure-RegistryPath -Path $path
-            New-ItemProperty -Path $path -Name $entry.Name -PropertyType $entry.ValueKind -Value $entry.CurrentValue -Force | Out-Null
+    foreach ($group in @($Entries | Group-Object -Property Sid)) {
+        $groupEntries = @($group.Group)
+        if ($groupEntries.Count -eq 0) {
+            continue
+        }
+
+        $sid = [string]$group.Name
+        $sampleEntry = $groupEntries[0]
+        $target = if ($targetsBySid.ContainsKey($sid)) {
+            $targetsBySid[$sid]
         } else {
-            Remove-ItemProperty -Path $path -Name $entry.Name -ErrorAction SilentlyContinue
+            [PSCustomObject]@{
+                Sid         = $sid
+                ProfilePath = if ($null -ne $sampleEntry.PSObject.Properties['ProfilePath']) { [string]$sampleEntry.ProfilePath } else { $null }
+                HivePath    = if ($null -ne $sampleEntry.PSObject.Properties['HivePath']) { [string]$sampleEntry.HivePath } else { $null }
+                Loaded      = $false
+            }
+        }
+
+        $access = $null
+        try {
+            $access = Open-UserRegistryTarget -Target $target
+
+            foreach ($entry in $groupEntries) {
+                $path = "$($access.RootPath)\$($entry.RelativePath)"
+
+                if ($entry.Exists) {
+                    Ensure-RegistryPath -Path $path
+                    New-ItemProperty -Path $path -Name $entry.Name -PropertyType $entry.ValueKind -Value $entry.CurrentValue -Force | Out-Null
+                } else {
+                    Remove-ItemProperty -Path $path -Name $entry.Name -ErrorAction SilentlyContinue
+                }
+            }
+        } catch {
+            Write-Warning ("Failed to restore user-scoped registry values for SID {0}: {1}" -f $sid, $_.Exception.Message)
+        } finally {
+            Close-UserRegistryTarget -Target $access
         }
     }
 }
@@ -648,58 +934,256 @@ function ConvertTo-NullableBoolean {
     }
 }
 
-function ConvertTo-WsManPolicyDword {
-    param([AllowNull()] [object]$Value)
+function Resolve-WsManConfigTarget {
+    param([Parameter(Mandatory)] [string]$Path)
 
-    if ($null -eq $Value) {
-        return $null
+    $prefix = 'WSMan:\localhost\'
+    if (-not $Path.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) {
+        throw "Unsupported WSMan path: $Path"
     }
 
-    if ($Value -is [bool]) {
-        if ($Value) { return 1 } else { return 0 }
+    $relativePath = $Path.Substring($prefix.Length)
+    $segments = @($relativePath -split '\\')
+    if ($segments.Count -lt 2) {
+        throw "Unsupported WSMan path: $Path"
     }
 
-    switch -Exact (([string]$Value).ToLowerInvariant()) {
-        'true' { return 1 }
-        'false' { return 0 }
-        '1' { 1 }
-        '0' { 0 }
+    $role = [string]$segments[0]
+    $resourceRole = switch -Exact ($role.ToLowerInvariant()) {
+        'service' { 'service' }
+        'client' { 'client' }
+        default { throw "Unsupported WSMan path role: $Path" }
+    }
+
+    if ($segments.Count -eq 2) {
+        $name = [string]$segments[1]
+        switch -Exact ($name) {
+            'AllowUnencrypted' {
+                return [PSCustomObject]@{
+                    ResourceUri = "winrm/config/$resourceRole"
+                    Property    = 'AllowUnencrypted'
+                    ValueKind   = 'Boolean'
+                }
+            }
+            'TrustedHosts' {
+                if ($resourceRole -ne 'client') {
+                    throw "Unsupported WSMan path for TrustedHosts: $Path"
+                }
+
+                return [PSCustomObject]@{
+                    ResourceUri = 'winrm/config/client'
+                    Property    = 'TrustedHosts'
+                    ValueKind   = 'String'
+                }
+            }
+            'IPv4Filter' {
+                if ($resourceRole -ne 'service') {
+                    throw "Unsupported WSMan path for IPv4Filter: $Path"
+                }
+
+                return [PSCustomObject]@{
+                    ResourceUri = 'winrm/config/service'
+                    Property    = 'IPv4Filter'
+                    ValueKind   = 'String'
+                }
+            }
+            'IPv6Filter' {
+                if ($resourceRole -ne 'service') {
+                    throw "Unsupported WSMan path for IPv6Filter: $Path"
+                }
+
+                return [PSCustomObject]@{
+                    ResourceUri = 'winrm/config/service'
+                    Property    = 'IPv6Filter'
+                    ValueKind   = 'String'
+                }
+            }
+            'EnableCompatibilityHttpListener' {
+                if ($resourceRole -ne 'service') {
+                    throw "Unsupported WSMan path for EnableCompatibilityHttpListener: $Path"
+                }
+
+                return [PSCustomObject]@{
+                    ResourceUri = 'winrm/config/service'
+                    Property    = 'EnableCompatibilityHttpListener'
+                    ValueKind   = 'Boolean'
+                }
+            }
+            'EnableCompatibilityHttpsListener' {
+                if ($resourceRole -ne 'service') {
+                    throw "Unsupported WSMan path for EnableCompatibilityHttpsListener: $Path"
+                }
+
+                return [PSCustomObject]@{
+                    ResourceUri = 'winrm/config/service'
+                    Property    = 'EnableCompatibilityHttpsListener'
+                    ValueKind   = 'Boolean'
+                }
+            }
+            'CbtHardeningLevel' {
+                if ($resourceRole -ne 'service') {
+                    throw "Unsupported WSMan path for CbtHardeningLevel: $Path"
+                }
+
+                return [PSCustomObject]@{
+                    ResourceUri = 'winrm/config/service'
+                    Property    = 'CbtHardeningLevel'
+                    ValueKind   = 'String'
+                }
+            }
+            default {
+                throw "Unsupported WSMan path: $Path"
+            }
+        }
+    }
+
+    if ($segments.Count -eq 3 -and [string]$segments[1] -eq 'Auth') {
+        $property = [string]$segments[2]
+        $supportedAuthProperties = if ($resourceRole -eq 'client') {
+            @('Basic', 'Digest', 'Kerberos', 'Negotiate', 'Certificate', 'CredSSP')
+        } else {
+            @('Basic', 'Kerberos', 'Negotiate', 'Certificate', 'CredSSP')
+        }
+
+        if ($supportedAuthProperties -notcontains $property) {
+            throw "Unsupported WSMan auth path: $Path"
+        }
+
+        return [PSCustomObject]@{
+            ResourceUri = "winrm/config/$resourceRole/auth"
+            Property    = $property
+            ValueKind   = 'Boolean'
+        }
+    }
+
+    throw "Unsupported WSMan path: $Path"
+}
+
+function ConvertFrom-WsManPropertyValue {
+    param(
+        [AllowNull()] [object]$Value,
+        [Parameter(Mandatory)] [string]$ValueKind
+    )
+
+    switch ($ValueKind) {
+        'Boolean' { return (ConvertTo-NullableBoolean -Value $Value) }
+        'String' {
+            if ($null -eq $Value) {
+                return $null
+            }
+
+            return [string]$Value
+        }
         default {
-            throw "Unsupported WSMan policy value: $Value"
+            throw "Unsupported WSMan value kind: $ValueKind"
         }
     }
 }
 
-function Get-WsManPolicyTarget {
-    param([Parameter(Mandatory)] [string]$Path)
+function ConvertTo-WsManSetValue {
+    param(
+        [AllowNull()] [object]$Value,
+        [Parameter(Mandatory)] [string]$ValueKind
+    )
 
-    switch ($Path) {
-        'WSMan:\localhost\Service\AllowUnencrypted' {
-            return [PSCustomObject]@{
-                RegistryPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
-                Name         = 'AllowUnencryptedTraffic'
+    switch ($ValueKind) {
+        'Boolean' {
+            $boolValue = ConvertTo-NullableBoolean -Value $Value
+            if ($null -eq $boolValue) {
+                throw "Unsupported WSMan boolean value: $Value"
             }
+
+            return (ConvertTo-WsManTextValue -Value $boolValue)
         }
-        'WSMan:\localhost\Client\AllowUnencrypted' {
-            return [PSCustomObject]@{
-                RegistryPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client'
-                Name         = 'AllowUnencryptedTraffic'
+        'String' {
+            if ($null -eq $Value) {
+                return ''
             }
-        }
-        'WSMan:\localhost\Service\Auth\Basic' {
-            return [PSCustomObject]@{
-                RegistryPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Service'
-                Name         = 'AllowBasic'
-            }
-        }
-        'WSMan:\localhost\Client\Auth\Basic' {
-            return [PSCustomObject]@{
-                RegistryPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WinRM\Client'
-                Name         = 'AllowBasic'
-            }
+
+            return [string]$Value
         }
         default {
-            throw "Unsupported WSMan path for policy write: $Path"
+            throw "Unsupported WSMan value kind: $ValueKind"
+        }
+    }
+}
+
+function Get-WsManConfigValueState {
+    param([Parameter(Mandatory)] [string]$Path)
+
+    $target = Resolve-WsManConfigTarget -Path $Path
+    if (-not (Test-CommandAvailable -Name 'Get-WSManInstance')) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            Captured         = $false
+            Value            = $null
+            Error            = 'Get-WSManInstance was not found.'
+        }
+    }
+
+    try {
+        $instance = Get-WSManInstance -ResourceURI $target.ResourceUri -ErrorAction Stop
+    } catch {
+        return [PSCustomObject]@{
+            CommandAvailable = $true
+            Captured         = $false
+            Value            = $null
+            Error            = $_.Exception.Message
+        }
+    }
+
+    $property = $instance.PSObject.Properties[$target.Property]
+    if ($null -eq $property) {
+        return [PSCustomObject]@{
+            CommandAvailable = $true
+            Captured         = $false
+            Value            = $null
+            Error            = "WSMan property $($target.Property) was not returned for $Path."
+        }
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable = $true
+        Captured         = $true
+        Value            = ConvertFrom-WsManPropertyValue -Value $property.Value -ValueKind $target.ValueKind
+        Error            = $null
+    }
+}
+
+function Invoke-WithTemporaryWinRmServiceForWrite {
+    param([Parameter(Mandatory)] [scriptblock]$ScriptBlock)
+
+    $service = Get-CimInstance Win32_Service -Filter "Name='WinRM'" -ErrorAction SilentlyContinue
+    if ($null -eq $service) {
+        & $ScriptBlock
+        return
+    }
+
+    $originalStartMode = [string]$service.StartMode
+    $wasRunning = ([string]$service.State -eq 'Running')
+    $changedStartMode = $false
+    $startedService = $false
+
+    try {
+        if (-not $wasRunning) {
+            if ($originalStartMode -eq 'Disabled') {
+                & sc.exe config WinRM "start= demand" | Out-Null
+                $changedStartMode = $true
+            }
+
+            Start-Service -Name 'WinRM' -ErrorAction Stop
+            $startedService = $true
+        }
+
+        & $ScriptBlock
+    } finally {
+        if ($startedService) {
+            Stop-Service -Name 'WinRM' -Force -ErrorAction SilentlyContinue
+        }
+
+        if ($changedStartMode) {
+            $startModeValue = Convert-ServiceStartModeToScValue -StartMode $originalStartMode
+            & sc.exe config WinRM "start= $startModeValue" | Out-Null
         }
     }
 }
@@ -707,13 +1191,7 @@ function Get-WsManPolicyTarget {
 function Get-WsManConfigValue {
     param([Parameter(Mandatory)] [string]$Path)
 
-    $policyTarget = Get-WsManPolicyTarget -Path $Path
-    $policyItem = Get-ItemProperty -Path $policyTarget.RegistryPath -Name $policyTarget.Name -ErrorAction SilentlyContinue
-    if ($null -ne $policyItem -and $null -ne $policyItem.$($policyTarget.Name)) {
-        return ConvertFrom-WsManTextValue -Value $policyItem.$($policyTarget.Name)
-    }
-
-    $null
+    (Get-WsManConfigValueState -Path $Path).Value
 }
 
 function Set-WsManConfigValue {
@@ -722,17 +1200,151 @@ function Set-WsManConfigValue {
         [AllowNull()] [object]$Value
     )
 
-    $target = Get-WsManPolicyTarget -Path $Path
-    $registryValue = ConvertTo-WsManPolicyDword -Value $Value
-
-    Ensure-RegistryPath -Path $target.RegistryPath
-
-    if ($null -eq $registryValue) {
-        Remove-ItemProperty -Path $target.RegistryPath -Name $target.Name -ErrorAction SilentlyContinue
-        return
+    $target = Resolve-WsManConfigTarget -Path $Path
+    if (-not (Test-CommandAvailable -Name 'Set-WSManInstance')) {
+        throw 'Set-WSManInstance was not found.'
     }
 
-    New-ItemProperty -Path $target.RegistryPath -Name $target.Name -PropertyType DWord -Value $registryValue -Force | Out-Null
+    $valueSet = @{
+        $target.Property = ConvertTo-WsManSetValue -Value $Value -ValueKind $target.ValueKind
+    }
+
+    Invoke-WithTemporaryWinRmServiceForWrite -ScriptBlock {
+        Set-WSManInstance -ResourceURI $target.ResourceUri -ValueSet $valueSet -ErrorAction Stop | Out-Null
+    }
+}
+
+function Get-WinRmListenerStates {
+    if (-not (Test-CommandAvailable -Name 'Get-WSManInstance')) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            Captured         = $false
+            Listeners        = @()
+            Error            = 'Get-WSManInstance was not found.'
+        }
+    }
+
+    try {
+        $listenerItems = @(Get-WSManInstance -ResourceURI 'winrm/config/listener' -Enumerate -ErrorAction Stop)
+    } catch {
+        return [PSCustomObject]@{
+            CommandAvailable = $true
+            Captured         = $false
+            Listeners        = @()
+            Error            = $_.Exception.Message
+        }
+    }
+
+    $listeners = @(
+        foreach ($listener in $listenerItems) {
+            [PSCustomObject]@{
+                Address               = if ($listener.PSObject.Properties['Address']) { [string]$listener.Address } else { $null }
+                Transport             = if ($listener.PSObject.Properties['Transport']) { [string]$listener.Transport } else { $null }
+                Port                  = if ($listener.PSObject.Properties['Port'] -and -not [string]::IsNullOrWhiteSpace([string]$listener.Port)) { [int]$listener.Port } else { $null }
+                Hostname              = if ($listener.PSObject.Properties['Hostname']) { [string]$listener.Hostname } else { $null }
+                Enabled               = if ($listener.PSObject.Properties['Enabled']) { ConvertTo-NullableBoolean -Value $listener.Enabled } else { $null }
+                URLPrefix             = if ($listener.PSObject.Properties['URLPrefix']) { [string]$listener.URLPrefix } else { $null }
+                CertificateThumbprint = if ($listener.PSObject.Properties['CertificateThumbprint']) { [string]$listener.CertificateThumbprint } else { $null }
+            }
+        }
+    ) | Sort-Object -Property Address, Transport, Port, Hostname, URLPrefix, CertificateThumbprint
+
+    [PSCustomObject]@{
+        CommandAvailable = $true
+        Captured         = $true
+        Listeners        = @($listeners)
+        Error            = $null
+    }
+}
+
+function Remove-WinRmListener {
+    param([Parameter(Mandatory)] [object]$Listener)
+
+    if (-not (Test-CommandAvailable -Name 'Remove-WSManInstance')) {
+        throw 'Remove-WSManInstance was not found.'
+    }
+
+    $selectorSet = @{
+        Address   = [string]$Listener.Address
+        Transport = [string]$Listener.Transport
+    }
+
+    Remove-WSManInstance -ResourceURI 'winrm/config/listener' -SelectorSet $selectorSet -ErrorAction Stop | Out-Null
+}
+
+function New-WinRmListener {
+    param([Parameter(Mandatory)] [object]$Listener)
+
+    if (-not (Test-CommandAvailable -Name 'New-WSManInstance')) {
+        throw 'New-WSManInstance was not found.'
+    }
+
+    $selectorSet = @{
+        Address   = [string]$Listener.Address
+        Transport = [string]$Listener.Transport
+    }
+
+    $valueSet = @{}
+    if ($null -ne $Listener.PSObject.Properties['Port'] -and $null -ne $Listener.Port) {
+        $valueSet['Port'] = [string][int]$Listener.Port
+    }
+
+    if ($null -ne $Listener.PSObject.Properties['Hostname'] -and -not [string]::IsNullOrWhiteSpace([string]$Listener.Hostname)) {
+        $valueSet['Hostname'] = [string]$Listener.Hostname
+    }
+
+    if ($null -ne $Listener.PSObject.Properties['Enabled'] -and $null -ne $Listener.Enabled) {
+        $valueSet['Enabled'] = ConvertTo-WsManTextValue -Value ([bool]$Listener.Enabled)
+    }
+
+    if ($null -ne $Listener.PSObject.Properties['URLPrefix'] -and -not [string]::IsNullOrWhiteSpace([string]$Listener.URLPrefix)) {
+        $valueSet['URLPrefix'] = [string]$Listener.URLPrefix
+    }
+
+    if (
+        [string]$Listener.Transport -eq 'HTTPS' -and
+        $null -ne $Listener.PSObject.Properties['CertificateThumbprint'] -and
+        -not [string]::IsNullOrWhiteSpace([string]$Listener.CertificateThumbprint)
+    ) {
+        $valueSet['CertificateThumbprint'] = [string]$Listener.CertificateThumbprint
+    }
+
+    New-WSManInstance -ResourceURI 'winrm/config/listener' -SelectorSet $selectorSet -ValueSet $valueSet -ErrorAction Stop | Out-Null
+}
+
+function Set-WinRmListenersExact {
+    param([Parameter(Mandatory)] [object[]]$Listeners)
+
+    Invoke-WithTemporaryWinRmServiceForWrite -ScriptBlock {
+        $liveState = Get-WinRmListenerStates
+        if (-not $liveState.CommandAvailable) {
+            throw 'Get-WSManInstance was not found.'
+        }
+
+        if (-not $liveState.Captured) {
+            throw $liveState.Error
+        }
+
+        foreach ($listener in @($liveState.Listeners)) {
+            Remove-WinRmListener -Listener $listener
+        }
+
+        foreach ($listener in @($Listeners)) {
+            New-WinRmListener -Listener $listener
+        }
+    }
+}
+
+function Set-Permissive-WinRmListeners {
+    param([Parameter(Mandatory)] [object[]]$Listeners)
+
+    Set-WinRmListenersExact -Listeners @($Listeners)
+}
+
+function Restore-WinRmListeners {
+    param([Parameter(Mandatory)] [object[]]$Listeners)
+
+    Set-WinRmListenersExact -Listeners @($Listeners)
 }
 
 function Normalize-SmbConfigState {
@@ -1159,6 +1771,160 @@ function Resolve-MpPreferenceValue {
     return $Value
 }
 
+function Normalize-MpPreferenceListItems {
+    param([AllowNull()] [object]$Value)
+
+    @(
+        foreach ($item in @($Value)) {
+            $text = [string]$item
+            if ([string]::IsNullOrWhiteSpace($text)) {
+                continue
+            }
+
+            $text.Trim()
+        }
+    ) | Sort-Object -Unique
+}
+
+function Get-MpPreferenceListState {
+    param([Parameter(Mandatory)] [string]$Property)
+
+    if (-not (Test-CommandAvailable -Name 'Get-MpPreference')) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            Captured         = $false
+            Items            = @()
+            Error            = $null
+        }
+    }
+
+    try {
+        $mp = Get-MpPreference -ErrorAction Stop
+    } catch {
+        return [PSCustomObject]@{
+            CommandAvailable = $true
+            Captured         = $false
+            Items            = @()
+            Error            = $_.Exception.Message
+        }
+    }
+
+    $propertyInfo = $mp.PSObject.Properties[$Property]
+    if ($null -eq $propertyInfo) {
+        return [PSCustomObject]@{
+            CommandAvailable = $true
+            Captured         = $false
+            Items            = @()
+            Error            = "Get-MpPreference does not expose property '$Property'."
+        }
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable = $true
+        Captured         = $true
+        Items            = @(Normalize-MpPreferenceListItems -Value $propertyInfo.Value)
+        Error            = $null
+    }
+}
+
+function Test-MpPreferenceListCapturedExactly {
+    param([Parameter(Mandatory)] [object]$Entry)
+
+    $commandAvailable = if ($Entry.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CommandAvailable } else { $true }
+    $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
+    ($commandAvailable -and $captured)
+}
+
+function Set-MpPreferenceListValue {
+    param(
+        [Parameter(Mandatory)] [string]$Property,
+        [AllowNull()] [object[]]$DesiredItems
+    )
+
+    $addCommand = Get-Command -Name 'Add-MpPreference' -ErrorAction SilentlyContinue | Select-Object -First 1
+    $removeCommand = Get-Command -Name 'Remove-MpPreference' -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (
+        $null -eq $addCommand -or
+        $null -eq $removeCommand -or
+        -not $addCommand.Parameters.ContainsKey($Property) -or
+        -not $removeCommand.Parameters.ContainsKey($Property)
+    ) {
+        return
+    }
+
+    $currentState = Get-MpPreferenceListState -Property $Property
+    if (-not ($currentState.CommandAvailable -and $currentState.Captured)) {
+        return
+    }
+
+    $currentItems = @(Normalize-MpPreferenceListItems -Value $currentState.Items)
+    $targetItems = @(Normalize-MpPreferenceListItems -Value $DesiredItems)
+    $itemsToRemove = @($currentItems | Where-Object { $_ -notin $targetItems })
+    $itemsToAdd = @($targetItems | Where-Object { $_ -notin $currentItems })
+
+    if ($itemsToRemove.Count -gt 0) {
+        $removeParams = @{}
+        $removeParams[$Property] = @($itemsToRemove)
+        Remove-MpPreference @removeParams
+    }
+
+    if ($itemsToAdd.Count -gt 0) {
+        $addParams = @{}
+        $addParams[$Property] = @($itemsToAdd)
+        Add-MpPreference @addParams
+    }
+}
+
+function Get-DefenderRuntimeStatus {
+    if (-not (Test-CommandAvailable -Name 'Get-MpComputerStatus')) {
+        return [PSCustomObject]@{
+            CommandAvailable          = $false
+            Captured                  = $false
+            AMRunningMode             = $null
+            RealTimeProtectionEnabled = $null
+            AntivirusEnabled          = $null
+            IsTamperProtected         = $null
+            Error                     = $null
+        }
+    }
+
+    try {
+        $status = Get-MpComputerStatus -ErrorAction Stop
+    } catch {
+        return [PSCustomObject]@{
+            CommandAvailable          = $true
+            Captured                  = $false
+            AMRunningMode             = $null
+            RealTimeProtectionEnabled = $null
+            AntivirusEnabled          = $null
+            IsTamperProtected         = $null
+            Error                     = $_.Exception.Message
+        }
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable          = $true
+        Captured                  = $true
+        AMRunningMode             = if ($status.PSObject.Properties['AMRunningMode']) { [string]$status.AMRunningMode } else { $null }
+        RealTimeProtectionEnabled = if ($status.PSObject.Properties['RealTimeProtectionEnabled']) { ConvertTo-NullableBoolean -Value $status.RealTimeProtectionEnabled } else { $null }
+        AntivirusEnabled          = if ($status.PSObject.Properties['AntivirusEnabled']) { ConvertTo-NullableBoolean -Value $status.AntivirusEnabled } else { $null }
+        IsTamperProtected         = if ($status.PSObject.Properties['IsTamperProtected']) { ConvertTo-NullableBoolean -Value $status.IsTamperProtected } else { $null }
+        Error                     = $null
+    }
+}
+
+function Test-DefenderRuntimeStatusCapturedExactly {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State) {
+        return $false
+    }
+
+    $commandAvailable = if ($State.PSObject.Properties['CommandAvailable']) { [bool]$State.CommandAvailable } else { $true }
+    $captured = if ($State.PSObject.Properties['Captured']) { [bool]$State.Captured } else { $true }
+    ($commandAvailable -and $captured)
+}
+
 function ConvertTo-BitLockerProtectionStatusLabel {
     param([AllowNull()] [object]$Value)
 
@@ -1209,16 +1975,358 @@ function Get-BitLockerCommandAvailableFlag {
     $true
 }
 
-function Test-BitLockerStateCapturedExactly {
+function New-BitLockerCaptureIssue {
+    param(
+        [string]$MountPoint,
+        [Parameter(Mandatory)] [string]$Message
+    )
+
+    [PSCustomObject]@{
+        MountPoint = $MountPoint
+        Message    = $Message
+    }
+}
+
+function Get-BitLockerCaptureIssues {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State -or -not $State.PSObject.Properties['CaptureIssues']) {
+        return @()
+    }
+
+    @(
+        foreach ($issue in @($State.CaptureIssues)) {
+            if ($null -eq $issue) {
+                continue
+            }
+
+            [PSCustomObject]@{
+                MountPoint = if ($issue.PSObject.Properties['MountPoint']) { [string]$issue.MountPoint } else { $null }
+                Message    = if ($issue.PSObject.Properties['Message']) { [string]$issue.Message } else { $null }
+            }
+        }
+    )
+}
+
+function Get-BitLockerProtectionModeLabel {
+    param(
+        [AllowNull()] [object]$ProtectionStatus,
+        [AllowNull()] [object]$VolumeStatus,
+        [AllowNull()] [object]$EncryptionPercentage,
+        [AllowNull()] [object]$KeyProtectorCount
+    )
+
+    $protectionLabel = ConvertTo-BitLockerProtectionStatusLabel -Value $ProtectionStatus
+    if ($protectionLabel -eq 'On') {
+        return 'Protected'
+    }
+
+    if ([string]$VolumeStatus -eq 'FullyDecrypted' -or ($null -ne $EncryptionPercentage -and [int]$EncryptionPercentage -eq 0)) {
+        return 'Decrypted'
+    }
+
+    if ($protectionLabel -eq 'Off') {
+        if ($null -ne $KeyProtectorCount -and [int]$KeyProtectorCount -gt 0) {
+            return 'Suspended'
+        }
+
+        if ([string]$VolumeStatus -match 'Encrypt') {
+            return 'Suspended'
+        }
+
+        return 'ProtectionOff'
+    }
+
+    if ([string]::IsNullOrWhiteSpace([string]$protectionLabel)) {
+        return 'Unknown'
+    }
+
+    return [string]$protectionLabel
+}
+
+function Test-BitLockerAutoUnlockSupportedVolume {
+    param([AllowNull()] [object]$Volume)
+
+    if ($null -eq $Volume) {
+        return $false
+    }
+
+    $mountPoint = if ($Volume.PSObject.Properties['MountPoint']) { [string]$Volume.MountPoint } else { $null }
+    if ([string]::IsNullOrWhiteSpace($mountPoint)) {
+        return $false
+    }
+
+    $volumeType = if ($Volume.PSObject.Properties['VolumeType']) { [string]$Volume.VolumeType } else { $null }
+    if ([string]::Equals($volumeType, 'OperatingSystem', [System.StringComparison]::OrdinalIgnoreCase)) {
+        return $false
+    }
+
+    $true
+}
+
+function Normalize-BitLockerVolumeState {
+    param([AllowNull()] [object]$Volume)
+
+    if ($null -eq $Volume) {
+        return $null
+    }
+
+    $keyProtectors = @()
+    if ($Volume.PSObject.Properties['KeyProtectors']) {
+        $keyProtectors = @(
+            foreach ($protector in @($Volume.KeyProtectors)) {
+                if ($null -eq $protector) {
+                    continue
+                }
+
+                [PSCustomObject]@{
+                    KeyProtectorId   = if ($protector.PSObject.Properties['KeyProtectorId']) { [string]$protector.KeyProtectorId } else { $null }
+                    KeyProtectorType = if ($protector.PSObject.Properties['KeyProtectorType']) { [string]$protector.KeyProtectorType } else { $null }
+                }
+            }
+        )
+    }
+
+    $keyProtectorCount = if ($Volume.PSObject.Properties['KeyProtectorCount'] -and $null -ne $Volume.KeyProtectorCount) {
+        [int]$Volume.KeyProtectorCount
+    } elseif ($Volume.PSObject.Properties['KeyProtectors']) {
+        @($keyProtectors).Count
+    } else {
+        $null
+    }
+
+    $encryptionPercentage = if ($Volume.PSObject.Properties['EncryptionPercentage'] -and $null -ne $Volume.EncryptionPercentage) {
+        [int]$Volume.EncryptionPercentage
+    } else {
+        $null
+    }
+
+    $protectionStatus = ConvertTo-BitLockerProtectionStatusLabel -Value $(if ($Volume.PSObject.Properties['ProtectionStatus']) { $Volume.ProtectionStatus } else { $null })
+    $volumeStatus = if ($Volume.PSObject.Properties['VolumeStatus']) { [string]$Volume.VolumeStatus } else { $null }
+
+    [PSCustomObject]@{
+        MountPoint           = if ($Volume.PSObject.Properties['MountPoint']) { [string]$Volume.MountPoint } else { $null }
+        VolumeType           = if ($Volume.PSObject.Properties['VolumeType']) { [string]$Volume.VolumeType } else { $null }
+        ProtectionStatus     = $protectionStatus
+        ProtectionMode       = if ($Volume.PSObject.Properties['ProtectionMode'] -and -not [string]::IsNullOrWhiteSpace([string]$Volume.ProtectionMode)) {
+            [string]$Volume.ProtectionMode
+        } else {
+            Get-BitLockerProtectionModeLabel -ProtectionStatus $protectionStatus -VolumeStatus $volumeStatus -EncryptionPercentage $encryptionPercentage -KeyProtectorCount $keyProtectorCount
+        }
+        VolumeStatus         = $volumeStatus
+        LockStatus           = if ($Volume.PSObject.Properties['LockStatus']) { [string]$Volume.LockStatus } else { $null }
+        EncryptionMethod     = if ($Volume.PSObject.Properties['EncryptionMethod']) { [string]$Volume.EncryptionMethod } else { $null }
+        EncryptionPercentage = $encryptionPercentage
+        KeyProtectorCount    = $keyProtectorCount
+        KeyProtectors        = @($keyProtectors)
+        AutoUnlockEnabled    = if ($Volume.PSObject.Properties['AutoUnlockEnabled']) { ConvertTo-NullableBoolean -Value $Volume.AutoUnlockEnabled } else { $null }
+    }
+}
+
+function Normalize-BitLockerState {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State) {
+        return [PSCustomObject]@{
+            CommandAvailable    = $false
+            TimedOutMountPoints = @()
+            CaptureIssues       = @()
+            Volumes             = @()
+        }
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable    = Get-BitLockerCommandAvailableFlag -State $State
+        TimedOutMountPoints = @(Get-BitLockerTimedOutMountPoints -State $State)
+        CaptureIssues       = @(Get-BitLockerCaptureIssues -State $State)
+        Volumes             = @(
+            foreach ($volume in @($State.Volumes)) {
+                Normalize-BitLockerVolumeState -Volume $volume
+            }
+        )
+    }
+}
+
+function Test-BitLockerStateHasExtendedFields {
     param([AllowNull()] [object]$State)
 
     if ($null -eq $State) {
         return $false
     }
 
-    $commandAvailable = Get-BitLockerCommandAvailableFlag -State $State
-    $timedOutMountPoints = @(Get-BitLockerTimedOutMountPoints -State $State)
-    $commandAvailable -and ($timedOutMountPoints.Count -eq 0)
+    if ($State.PSObject.Properties['CaptureIssues']) {
+        return $true
+    }
+
+    foreach ($volume in @($State.Volumes)) {
+        if ($null -eq $volume) {
+            continue
+        }
+
+        foreach ($propertyName in @('LockStatus', 'ProtectionMode', 'KeyProtectors')) {
+            if ($volume.PSObject.Properties[$propertyName]) {
+                return $true
+            }
+        }
+    }
+
+    $false
+}
+
+function Get-BitLockerProtectorTypeSummary {
+    param([AllowNull()] [object]$Volume)
+
+    if ($null -eq $Volume) {
+        return '<unknown>'
+    }
+
+    $types = @(
+        foreach ($protector in @($Volume.KeyProtectors)) {
+            if ($null -eq $protector) {
+                continue
+            }
+
+            $type = if ($protector.PSObject.Properties['KeyProtectorType']) { [string]$protector.KeyProtectorType } else { $null }
+            if ([string]::IsNullOrWhiteSpace($type)) {
+                continue
+            }
+
+            $type
+        }
+    ) | Sort-Object -Unique
+
+    if (@($types).Count -gt 0) {
+        return ($types -join ', ')
+    }
+
+    if ($Volume.PSObject.Properties['KeyProtectorCount'] -and $null -ne $Volume.KeyProtectorCount) {
+        $count = [int]$Volume.KeyProtectorCount
+        if ($count -eq 0) {
+            return '<none>'
+        }
+
+        return ('<count={0}>' -f $count)
+    }
+
+    '<unknown>'
+}
+
+function ConvertTo-ComparableBitLockerState {
+    param(
+        [AllowNull()] [object]$State,
+        [AllowNull()] [object]$ReferenceState
+    )
+
+    $normalizedState = Normalize-BitLockerState -State $State
+    $comparisonReference = if ($null -ne $ReferenceState) { $ReferenceState } else { $State }
+    $useExtendedFields = Test-BitLockerStateHasExtendedFields -State $comparisonReference
+    $comparisonCommandAvailable = $normalizedState.CommandAvailable
+    if (-not $useExtendedFields -and @($normalizedState.CaptureIssues).Count -gt 0) {
+        $comparisonCommandAvailable = $false
+    }
+
+    $comparableState = [ordered]@{
+        CommandAvailable    = $comparisonCommandAvailable
+        TimedOutMountPoints = @(
+            foreach ($mountPoint in @($normalizedState.TimedOutMountPoints | Sort-Object -Unique)) {
+                [string]$mountPoint
+            }
+        )
+    }
+
+    if ($useExtendedFields) {
+        $comparableState['CaptureIssues'] = @(
+            foreach ($issue in @($normalizedState.CaptureIssues | Sort-Object -Property MountPoint, Message)) {
+                [PSCustomObject]@{
+                    MountPoint = if (-not [string]::IsNullOrWhiteSpace([string]$issue.MountPoint)) { [string]$issue.MountPoint } else { $null }
+                    Message    = if (-not [string]::IsNullOrWhiteSpace([string]$issue.Message)) { [string]$issue.Message } else { $null }
+                }
+            }
+        )
+    }
+
+    $comparableState['Volumes'] = @(
+        foreach ($volume in @($normalizedState.Volumes | Sort-Object -Property MountPoint)) {
+            if ($useExtendedFields) {
+                [PSCustomObject]@{
+                    MountPoint           = [string]$volume.MountPoint
+                    VolumeType           = if (-not [string]::IsNullOrWhiteSpace([string]$volume.VolumeType)) { [string]$volume.VolumeType } else { $null }
+                    ProtectionStatus     = [string]$volume.ProtectionStatus
+                    ProtectionMode       = if (-not [string]::IsNullOrWhiteSpace([string]$volume.ProtectionMode)) { [string]$volume.ProtectionMode } else { $null }
+                    VolumeStatus         = if (-not [string]::IsNullOrWhiteSpace([string]$volume.VolumeStatus)) { [string]$volume.VolumeStatus } else { $null }
+                    LockStatus           = if (-not [string]::IsNullOrWhiteSpace([string]$volume.LockStatus)) { [string]$volume.LockStatus } else { $null }
+                    EncryptionMethod     = if (-not [string]::IsNullOrWhiteSpace([string]$volume.EncryptionMethod)) { [string]$volume.EncryptionMethod } else { $null }
+                    EncryptionPercentage = $volume.EncryptionPercentage
+                    KeyProtectorCount    = $volume.KeyProtectorCount
+                    KeyProtectors        = @(
+                        foreach ($protector in @($volume.KeyProtectors | Sort-Object -Property KeyProtectorId, KeyProtectorType)) {
+                            [PSCustomObject]@{
+                                KeyProtectorId   = if (-not [string]::IsNullOrWhiteSpace([string]$protector.KeyProtectorId)) { [string]$protector.KeyProtectorId } else { $null }
+                                KeyProtectorType = if (-not [string]::IsNullOrWhiteSpace([string]$protector.KeyProtectorType)) { [string]$protector.KeyProtectorType } else { $null }
+                            }
+                        }
+                    )
+                    AutoUnlockEnabled    = $volume.AutoUnlockEnabled
+                }
+                continue
+            }
+
+            [PSCustomObject]@{
+                MountPoint           = [string]$volume.MountPoint
+                ProtectionStatus     = [string]$volume.ProtectionStatus
+                VolumeStatus         = [string]$volume.VolumeStatus
+                EncryptionPercentage = $volume.EncryptionPercentage
+                KeyProtectorCount    = $volume.KeyProtectorCount
+            }
+        }
+    )
+
+    $comparableState
+}
+
+function Get-ManageBdeCommand {
+    foreach ($name in @('manage-bde.exe', 'manage-bde')) {
+        $command = Get-Command -Name $name -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($null -ne $command) {
+            return $command
+        }
+    }
+
+    $null
+}
+
+function Set-BitLockerAutoUnlockState {
+    param(
+        [Parameter(Mandatory)] [string]$MountPoint,
+        [Parameter(Mandatory)] [bool]$Enabled
+    )
+
+    $manageBde = Get-ManageBdeCommand
+    if ($null -eq $manageBde) {
+        throw 'manage-bde was not found.'
+    }
+
+    $action = if ($Enabled) { '-enable' } else { '-disable' }
+    $output = (& $manageBde.Source -autounlock $action $MountPoint 2>&1 | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0) {
+        $message = "manage-bde -autounlock $action $MountPoint failed with exit code $LASTEXITCODE"
+        if (-not [string]::IsNullOrWhiteSpace($output)) {
+            $message = "$message. Output: $output"
+        }
+
+        throw $message
+    }
+}
+
+function Test-BitLockerStateCapturedExactly {
+    param([AllowNull()] [object]$State)
+
+    $normalized = Normalize-BitLockerState -State $State
+    if ($null -eq $normalized) {
+        return $false
+    }
+
+    $normalized.CommandAvailable -and (@($normalized.TimedOutMountPoints).Count -eq 0) -and (@($normalized.CaptureIssues).Count -eq 0)
 }
 
 function Get-BitLockerVolumeStates {
@@ -1226,6 +2334,7 @@ function Get-BitLockerVolumeStates {
         return [PSCustomObject]@{
             CommandAvailable   = $false
             TimedOutMountPoints = @()
+            CaptureIssues      = @()
             Volumes            = @()
         }
     }
@@ -1238,6 +2347,7 @@ function Get-BitLockerVolumeStates {
     )
 
     $timedOutMountPoints = [System.Collections.Generic.List[string]]::new()
+    $captureIssues = [System.Collections.Generic.List[object]]::new()
     $states = foreach ($mountPoint in $mountPoints) {
         Write-Verbose ("BitLocker snapshot mount point {0}" -f $mountPoint)
         $escapedMountPoint = $mountPoint.Replace("'", "''")
@@ -1248,14 +2358,47 @@ if (`$null -eq `$volume) {
     return
 }
 
+[bool]`$keyProtectorsCaptured = `$false
+`$keyProtectors = @()
+if (`$volume.PSObject.Properties['KeyProtector']) {
+    `$keyProtectorsCaptured = `$true
+    `$keyProtectors = @(
+        foreach (`$protector in @(`$volume.KeyProtector)) {
+            if (`$null -eq `$protector) {
+                continue
+            }
+
+            [PSCustomObject]@{
+                KeyProtectorId   = if (`$protector.PSObject.Properties['KeyProtectorId']) { [string]`$protector.KeyProtectorId } else { `$null }
+                KeyProtectorType = if (`$protector.PSObject.Properties['KeyProtectorType']) { [string]`$protector.KeyProtectorType } else { `$null }
+            }
+        }
+    )
+}
+
+[bool]`$autoUnlockCaptured = `$false
+`$autoUnlockEnabled = `$null
+if (`$volume.PSObject.Properties['AutoUnlockEnabled']) {
+    `$autoUnlockCaptured = `$true
+    if (`$null -ne `$volume.AutoUnlockEnabled) {
+        `$autoUnlockEnabled = [bool]`$volume.AutoUnlockEnabled
+    }
+}
+
 [PSCustomObject]@{
     MountPoint           = [string]`$volume.MountPoint
     VolumeType           = [string]`$volume.VolumeType
     ProtectionStatus     = [string]`$volume.ProtectionStatus
     VolumeStatus         = [string]`$volume.VolumeStatus
+    LockStatus           = if (`$volume.PSObject.Properties['LockStatus']) { [string]`$volume.LockStatus } else { `$null }
     EncryptionMethod     = [string]`$volume.EncryptionMethod
     EncryptionPercentage = if (`$null -ne `$volume.EncryptionPercentage) { [int]`$volume.EncryptionPercentage } else { `$null }
-} | ConvertTo-Json -Compress -Depth 4
+    KeyProtectorCount    = @(`$keyProtectors).Count
+    KeyProtectors        = @(`$keyProtectors)
+    KeyProtectorsCaptured = `$keyProtectorsCaptured
+    AutoUnlockEnabled    = `$autoUnlockEnabled
+    AutoUnlockCaptured   = `$autoUnlockCaptured
+} | ConvertTo-Json -Compress -Depth 6
 "@
 
         if ($result.TimedOut) {
@@ -1267,12 +2410,17 @@ if (`$null -eq `$volume) {
         if ($result.ExitCode -ne 0) {
             if (-not [string]::IsNullOrWhiteSpace([string]$result.StdErr)) {
                 Write-Warning ("BitLocker snapshot failed on mount point {0}: {1}" -f $mountPoint, $result.StdErr.Trim())
+                $captureIssues.Add((New-BitLockerCaptureIssue -MountPoint $mountPoint -Message $result.StdErr.Trim())) | Out-Null
+            } else {
+                $captureIssues.Add((New-BitLockerCaptureIssue -MountPoint $mountPoint -Message 'BitLocker snapshot command failed for this mount point.')) | Out-Null
             }
             continue
         }
 
         $json = [string]$result.StdOut
         if ([string]::IsNullOrWhiteSpace($json)) {
+            Write-Warning "BitLocker snapshot returned no data on mount point $mountPoint. Skipping it."
+            $captureIssues.Add((New-BitLockerCaptureIssue -MountPoint $mountPoint -Message 'BitLocker snapshot returned no data for this mount point.')) | Out-Null
             continue
         }
 
@@ -1280,24 +2428,26 @@ if (`$null -eq `$volume) {
             $volume = $json | ConvertFrom-Json -ErrorAction Stop
         } catch {
             Write-Warning "BitLocker snapshot returned unparsable output on mount point $mountPoint. Skipping it."
+            $captureIssues.Add((New-BitLockerCaptureIssue -MountPoint $mountPoint -Message 'BitLocker snapshot returned unparsable output for this mount point.')) | Out-Null
             continue
         }
 
-        [PSCustomObject]@{
-            MountPoint           = [string]$volume.MountPoint
-            VolumeType           = [string]$volume.VolumeType
-            ProtectionStatus     = ConvertTo-BitLockerProtectionStatusLabel -Value $volume.ProtectionStatus
-            VolumeStatus         = [string]$volume.VolumeStatus
-            EncryptionMethod     = [string]$volume.EncryptionMethod
-            EncryptionPercentage = if ($null -ne $volume.EncryptionPercentage) { [int]$volume.EncryptionPercentage } else { $null }
-            KeyProtectorCount    = $null
-            AutoUnlockEnabled    = $null
+        $normalizedVolume = Normalize-BitLockerVolumeState -Volume $volume
+        if (-not ($volume.PSObject.Properties['KeyProtectorsCaptured'] -and [bool]$volume.KeyProtectorsCaptured)) {
+            $captureIssues.Add((New-BitLockerCaptureIssue -MountPoint $mountPoint -Message 'BitLocker key protector inventory could not be captured for this mount point.')) | Out-Null
         }
+
+        if ((Test-BitLockerAutoUnlockSupportedVolume -Volume $normalizedVolume) -and -not ($volume.PSObject.Properties['AutoUnlockCaptured'] -and [bool]$volume.AutoUnlockCaptured)) {
+            $captureIssues.Add((New-BitLockerCaptureIssue -MountPoint $mountPoint -Message 'BitLocker auto-unlock state could not be captured for this mount point.')) | Out-Null
+        }
+
+        $normalizedVolume
     }
 
     [PSCustomObject]@{
         CommandAvailable    = $true
         TimedOutMountPoints = @($timedOutMountPoints)
+        CaptureIssues       = @($captureIssues)
         Volumes             = @($states)
     }
 }
@@ -1321,7 +2471,9 @@ function Set-Permissive-BitLockerVolumes {
         return
     }
 
-    foreach ($volume in @($State.Volumes)) {
+    $normalizedState = Normalize-BitLockerState -State $State
+
+    foreach ($volume in @($normalizedState.Volumes)) {
         if (-not (Test-BitLockerProtectionEnabled -Value $volume.ProtectionStatus)) {
             continue
         }
@@ -1333,6 +2485,26 @@ function Set-Permissive-BitLockerVolumes {
         }
 
         Suspend-BitLocker -MountPoint $mountPoint -RebootCount 0 -ErrorAction SilentlyContinue | Out-Null
+    }
+
+    foreach ($volume in @($normalizedState.Volumes)) {
+        if (-not (Test-BitLockerAutoUnlockSupportedVolume -Volume $volume)) {
+            continue
+        }
+
+        if ($null -eq $volume.AutoUnlockEnabled -or $volume.AutoUnlockEnabled) {
+            continue
+        }
+
+        if ([string]$volume.ProtectionMode -eq 'Decrypted') {
+            continue
+        }
+
+        try {
+            Set-BitLockerAutoUnlockState -MountPoint ([string]$volume.MountPoint) -Enabled $true
+        } catch {
+            Write-Warning ("Failed to enable BitLocker auto-unlock for {0}: {1}" -f ([string]$volume.MountPoint), $_.Exception.Message)
+        }
     }
 }
 
@@ -1347,7 +2519,9 @@ function Restore-BitLockerVolumes {
         return
     }
 
-    foreach ($volume in @($State.Volumes)) {
+    $normalizedState = Normalize-BitLockerState -State $State
+
+    foreach ($volume in @($normalizedState.Volumes)) {
         $mountPoint = [string]$volume.MountPoint
         if ([string]::IsNullOrWhiteSpace($mountPoint)) {
             continue
@@ -1374,6 +2548,283 @@ function Restore-BitLockerVolumes {
             Suspend-BitLocker -MountPoint $mountPoint -RebootCount 0 -ErrorAction SilentlyContinue | Out-Null
         }
     }
+
+    foreach ($volume in @($normalizedState.Volumes)) {
+        if (-not (Test-BitLockerAutoUnlockSupportedVolume -Volume $volume)) {
+            continue
+        }
+
+        if ($null -eq $volume.AutoUnlockEnabled) {
+            continue
+        }
+
+        try {
+            Set-BitLockerAutoUnlockState -MountPoint ([string]$volume.MountPoint) -Enabled ([bool]$volume.AutoUnlockEnabled)
+        } catch {
+            Write-Warning ("Failed to restore BitLocker auto-unlock for {0}: {1}" -f ([string]$volume.MountPoint), $_.Exception.Message)
+        }
+    }
+}
+
+function New-AppLockerCaptureIssue {
+    param(
+        [string]$Scope,
+        [Parameter(Mandatory)] [string]$Message
+    )
+
+    [PSCustomObject]@{
+        Scope   = $Scope
+        Message = $Message
+    }
+}
+
+function ConvertTo-AppLockerXmlText {
+    param([AllowNull()] [object]$Value)
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    if ($Value -is [string]) {
+        return ([string]$Value).Trim()
+    }
+
+    ((@($Value) | ForEach-Object { [string]$_ }) -join [Environment]::NewLine).Trim()
+}
+
+function Normalize-AppLockerXml {
+    param([AllowNull()] [string]$Xml)
+
+    if ([string]::IsNullOrWhiteSpace($Xml)) {
+        return ''
+    }
+
+    try {
+        $document = New-Object System.Xml.XmlDocument
+        $document.PreserveWhitespace = $false
+        $document.LoadXml($Xml)
+        $document.OuterXml
+    } catch {
+        $Xml.Trim()
+    }
+}
+
+function Get-AppLockerCollectionSummaries {
+    param([AllowNull()] [string]$Xml)
+
+    if ([string]::IsNullOrWhiteSpace($Xml)) {
+        return @()
+    }
+
+    try {
+        $document = New-Object System.Xml.XmlDocument
+        $document.PreserveWhitespace = $false
+        $document.LoadXml($Xml)
+
+        @(
+            foreach ($ruleCollection in @($document.SelectNodes('/AppLockerPolicy/RuleCollection'))) {
+                if ($null -eq $ruleCollection) {
+                    continue
+                }
+
+                $ruleCount = @(
+                    foreach ($childNode in @($ruleCollection.ChildNodes)) {
+                        if (
+                            $childNode -is [System.Xml.XmlElement] -and
+                            $childNode.LocalName -like '*Rule'
+                        ) {
+                            $childNode
+                        }
+                    }
+                ).Count
+
+                $servicesNode = $ruleCollection.SelectSingleNode('RuleCollectionExtensions/ThresholdExtensions/Services')
+                $systemAppsNode = $ruleCollection.SelectSingleNode('RuleCollectionExtensions/RedstoneExtensions/SystemApps')
+
+                [PSCustomObject]@{
+                    Type                = if ($ruleCollection.Attributes['Type']) { [string]$ruleCollection.Attributes['Type'].Value } else { $null }
+                    EnforcementMode     = if ($ruleCollection.Attributes['EnforcementMode']) { [string]$ruleCollection.Attributes['EnforcementMode'].Value } else { 'NotConfigured' }
+                    RuleCount           = $ruleCount
+                    ServicesEnforcement = if ($null -ne $servicesNode -and $servicesNode.Attributes['EnforcementMode']) { [string]$servicesNode.Attributes['EnforcementMode'].Value } else { $null }
+                    SystemAppsAllow     = if ($null -ne $systemAppsNode -and $systemAppsNode.Attributes['Allow']) { [string]$systemAppsNode.Attributes['Allow'].Value } else { $null }
+                }
+            }
+        )
+    } catch {
+        @()
+    }
+}
+
+function Get-AppLockerPolicyXml {
+    param(
+        [AllowNull()] [object]$State,
+        [ValidateSet('Local', 'Effective')] [string]$PolicyScope = 'Effective',
+        [string]$SnapshotPath
+    )
+
+    if ($null -eq $State) {
+        return ''
+    }
+
+    $inlineProperty = if ($PolicyScope -eq 'Local') { 'LocalXml' } else { 'EffectiveXml' }
+    $assetProperty = if ($PolicyScope -eq 'Local') { 'LocalSnapshotAssetRelativePath' } else { 'EffectiveSnapshotAssetRelativePath' }
+
+    if (
+        $State.PSObject.Properties[$inlineProperty] -and
+        -not [string]::IsNullOrWhiteSpace([string]$State.PSObject.Properties[$inlineProperty].Value)
+    ) {
+        return [string]$State.PSObject.Properties[$inlineProperty].Value
+    }
+
+    if (
+        $State.PSObject.Properties[$assetProperty] -and
+        -not [string]::IsNullOrWhiteSpace([string]$State.PSObject.Properties[$assetProperty].Value) -and
+        -not [string]::IsNullOrWhiteSpace($SnapshotPath)
+    ) {
+        $assetRoot = Get-SnapshotAssetRoot -SnapshotPath $SnapshotPath
+        $assetPath = Join-Path $assetRoot ([string]$State.PSObject.Properties[$assetProperty].Value)
+        if (-not (Test-Path -LiteralPath $assetPath)) {
+            throw "AppLocker snapshot asset is missing: $assetPath"
+        }
+
+        return Get-Content -LiteralPath $assetPath -Raw
+    }
+
+    ''
+}
+
+function Get-AppLockerPolicyState {
+    if (-not (Test-CommandAvailable -Name 'Get-AppLockerPolicy')) {
+        return [PSCustomObject]@{
+            CommandAvailable      = $false
+            LocalCaptured         = $false
+            EffectiveCaptured     = $false
+            LocalMatchesEffective = $false
+            CaptureIssues         = @()
+            CollectionSummaries   = @()
+            LocalXml              = $null
+            EffectiveXml          = $null
+        }
+    }
+
+    $captureIssues = [System.Collections.Generic.List[object]]::new()
+    $localXml = ''
+    $effectiveXml = ''
+    $localCaptured = $false
+    $effectiveCaptured = $false
+
+    try {
+        $localXml = ConvertTo-AppLockerXmlText -Value (Get-AppLockerPolicy -Local -Xml -ErrorAction Stop)
+        $localCaptured = $true
+    } catch {
+        $captureIssues.Add((New-AppLockerCaptureIssue -Scope 'Local' -Message $_.Exception.Message)) | Out-Null
+    }
+
+    try {
+        $effectiveXml = ConvertTo-AppLockerXmlText -Value (Get-AppLockerPolicy -Effective -Xml -ErrorAction Stop)
+        $effectiveCaptured = $true
+    } catch {
+        $captureIssues.Add((New-AppLockerCaptureIssue -Scope 'Effective' -Message $_.Exception.Message)) | Out-Null
+    }
+
+    $normalizedLocalXml = Normalize-AppLockerXml -Xml $localXml
+    $normalizedEffectiveXml = Normalize-AppLockerXml -Xml $effectiveXml
+
+    [PSCustomObject]@{
+        CommandAvailable      = $true
+        LocalCaptured         = $localCaptured
+        EffectiveCaptured     = $effectiveCaptured
+        LocalMatchesEffective = (
+            $localCaptured -and
+            $effectiveCaptured -and
+            [string]::Equals($normalizedLocalXml, $normalizedEffectiveXml, [System.StringComparison]::Ordinal)
+        )
+        CaptureIssues         = @($captureIssues)
+        CollectionSummaries   = @(Get-AppLockerCollectionSummaries -Xml $effectiveXml)
+        LocalXml              = if ($localCaptured) { $localXml } else { $null }
+        EffectiveXml          = if ($effectiveCaptured) { $effectiveXml } else { $null }
+    }
+}
+
+function Test-AppLockerPolicyCapturedExactly {
+    param(
+        [AllowNull()] [object]$State,
+        [string]$SnapshotPath
+    )
+
+    if ($null -eq $State) {
+        return $false
+    }
+
+    $commandAvailable = if ($State.PSObject.Properties['CommandAvailable']) { [bool]$State.CommandAvailable } else { $true }
+    $localCaptured = if ($State.PSObject.Properties['LocalCaptured']) { [bool]$State.LocalCaptured } else { $false }
+    $effectiveCaptured = if ($State.PSObject.Properties['EffectiveCaptured']) { [bool]$State.EffectiveCaptured } else { $false }
+    $localMatchesEffective = if ($State.PSObject.Properties['LocalMatchesEffective']) { [bool]$State.LocalMatchesEffective } else { $false }
+    $captureIssues = if ($State.PSObject.Properties['CaptureIssues']) { @($State.CaptureIssues) } else { @() }
+    $localXml = Normalize-AppLockerXml -Xml (Get-AppLockerPolicyXml -State $State -PolicyScope Local -SnapshotPath $SnapshotPath)
+    $effectiveXml = Normalize-AppLockerXml -Xml (Get-AppLockerPolicyXml -State $State -PolicyScope Effective -SnapshotPath $SnapshotPath)
+
+    (
+        $commandAvailable -and
+        $localCaptured -and
+        $effectiveCaptured -and
+        $localMatchesEffective -and
+        (@($captureIssues).Count -eq 0) -and
+        -not [string]::IsNullOrWhiteSpace($localXml) -and
+        -not [string]::IsNullOrWhiteSpace($effectiveXml)
+    )
+}
+
+function Get-EmptyAppLockerPolicyXml {
+    '<AppLockerPolicy Version="1" />'
+}
+
+function Apply-AppLockerPolicyXml {
+    param([AllowNull()] [string]$Xml)
+
+    if ([string]::IsNullOrWhiteSpace($Xml) -or -not (Test-CommandAvailable -Name 'Set-AppLockerPolicy')) {
+        return
+    }
+
+    $tempPath = New-TemporaryFilePath -Extension '.xml'
+    try {
+        [System.IO.File]::WriteAllText($tempPath, $Xml, [System.Text.UTF8Encoding]::new($false))
+        Set-AppLockerPolicy -XmlPolicy $tempPath | Out-Null
+    } finally {
+        if (Test-Path -LiteralPath $tempPath) {
+            Remove-Item -LiteralPath $tempPath -Force -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Set-Permissive-AppLockerPolicy {
+    param(
+        [AllowNull()] [object]$State,
+        [string]$SnapshotPath
+    )
+
+    if ($null -eq $State) {
+        $State = Get-AppLockerPolicyState
+    }
+
+    if (-not (Test-AppLockerPolicyCapturedExactly -State $State -SnapshotPath $SnapshotPath)) {
+        return
+    }
+
+    Apply-AppLockerPolicyXml -Xml (Get-EmptyAppLockerPolicyXml)
+}
+
+function Restore-AppLockerPolicy {
+    param(
+        [Parameter(Mandatory)] [object]$State,
+        [string]$SnapshotPath
+    )
+
+    if (-not (Test-AppLockerPolicyCapturedExactly -State $State -SnapshotPath $SnapshotPath)) {
+        return
+    }
+
+    Apply-AppLockerPolicyXml -Xml (Get-AppLockerPolicyXml -State $State -PolicyScope Local -SnapshotPath $SnapshotPath)
 }
 
 function Get-ExploitProtectionPolicyState {
@@ -1709,6 +3160,61 @@ function Get-WdacPlatformManagedPolicies {
             $info = Get-WdacPolicyPlatformManagementInfo -Policy $policy
             if ($info.IsPlatformManaged) {
                 $info
+            }
+        }
+    )
+}
+
+function Get-WdacPolicyReportRows {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State -or -not $State.PSObject.Properties['Policies']) {
+        return @()
+    }
+
+    @(
+        foreach ($policy in @($State.Policies)) {
+            $policyInfo = Get-WdacPolicyPlatformManagementInfo -Policy $policy
+
+            $hasFileOnDisk = $null
+            if ($policy.PSObject.Properties['HasFileOnDisk']) {
+                $hasFileOnDisk = ConvertTo-NullableBoolean -Value $policy.HasFileOnDisk
+            }
+
+            $isEnforced = $null
+            foreach ($name in @('IsCurrentlyEnforced', 'IsEnforced')) {
+                if ($policy.PSObject.Properties[$name]) {
+                    $isEnforced = ConvertTo-NullableBoolean -Value $policy.$name
+                    if ($null -ne $isEnforced) {
+                        break
+                    }
+                }
+            }
+
+            $presence = if ($hasFileOnDisk -eq $true -and $isEnforced -eq $true) {
+                'Active + on-disk'
+            } elseif ($hasFileOnDisk -eq $true -and $isEnforced -eq $false) {
+                'On-disk only / pending reboot'
+            } elseif ($hasFileOnDisk -eq $false -and $isEnforced -eq $true) {
+                'Active only'
+            } elseif ($hasFileOnDisk -eq $false -and $isEnforced -eq $false) {
+                'Present but inactive'
+            } elseif ($hasFileOnDisk -eq $true) {
+                'On-disk state only'
+            } elseif ($isEnforced -eq $true) {
+                'Active state only'
+            } else {
+                'Unknown state'
+            }
+
+            [PSCustomObject]@{
+                PolicyId          = $policyInfo.PolicyId
+                FriendlyName      = $policyInfo.FriendlyName
+                Classification    = $policyInfo.Classification
+                IsPlatformManaged = $policyInfo.IsPlatformManaged
+                HasFileOnDisk     = $hasFileOnDisk
+                IsEnforced        = $isEnforced
+                Presence          = $presence
             }
         }
     )
@@ -2085,6 +3591,490 @@ function ConvertTo-FirewallProfileEnabledValue {
     }
 }
 
+function ConvertTo-FirewallProfileActionValue {
+    param([AllowNull()] [object]$Value)
+
+    switch ([string]$Value) {
+        'Allow' { 'Allow' }
+        'Block' { 'Block' }
+        'NotConfigured' { 'NotConfigured' }
+        default { [string]$Value }
+    }
+}
+
+function ConvertTo-FirewallProfileTriStateValue {
+    param([AllowNull()] [object]$Value)
+
+    switch ([string]$Value) {
+        'True' { 'True' }
+        'False' { 'False' }
+        'NotConfigured' { 'NotConfigured' }
+        '1' { 'True' }
+        '0' { 'False' }
+        default {
+            if ($Value -is [bool]) {
+                if ($Value) { 'True' } else { 'False' }
+            } else {
+                [string]$Value
+            }
+        }
+    }
+}
+
+function New-FirewallProfileCaptureIssue {
+    param(
+        [string]$Profile,
+        [Parameter(Mandatory)] [string]$Message
+    )
+
+    [PSCustomObject]@{
+        Profile = $Profile
+        Message = $Message
+    }
+}
+
+function Normalize-FirewallProfileEntry {
+    param([AllowNull()] [object]$Profile)
+
+    if ($null -eq $Profile) {
+        return $null
+    }
+
+    [PSCustomObject]@{
+        Profile                         = if ($Profile.PSObject.Properties['Profile']) { [string]$Profile.Profile } elseif ($Profile.PSObject.Properties['Name']) { [string]$Profile.Name } else { $null }
+        Enabled                         = if ($Profile.PSObject.Properties['Enabled']) { ConvertTo-FirewallProfileEnabledValue -Value $Profile.Enabled } else { $null }
+        DefaultInboundAction            = if ($Profile.PSObject.Properties['DefaultInboundAction']) { ConvertTo-FirewallProfileActionValue -Value $Profile.DefaultInboundAction } else { $null }
+        DefaultOutboundAction           = if ($Profile.PSObject.Properties['DefaultOutboundAction']) { ConvertTo-FirewallProfileActionValue -Value $Profile.DefaultOutboundAction } else { $null }
+        AllowUnicastResponseToMulticast = if ($Profile.PSObject.Properties['AllowUnicastResponseToMulticast']) { ConvertTo-FirewallProfileTriStateValue -Value $Profile.AllowUnicastResponseToMulticast } else { $null }
+        NotifyOnListen                  = if ($Profile.PSObject.Properties['NotifyOnListen']) { ConvertTo-FirewallProfileTriStateValue -Value $Profile.NotifyOnListen } else { $null }
+        LogAllowed                      = if ($Profile.PSObject.Properties['LogAllowed']) { ConvertTo-FirewallProfileTriStateValue -Value $Profile.LogAllowed } else { $null }
+        LogBlocked                      = if ($Profile.PSObject.Properties['LogBlocked']) { ConvertTo-FirewallProfileTriStateValue -Value $Profile.LogBlocked } else { $null }
+        LogIgnored                      = if ($Profile.PSObject.Properties['LogIgnored']) { ConvertTo-FirewallProfileTriStateValue -Value $Profile.LogIgnored } else { $null }
+        LogMaxSizeKilobytes             = if ($Profile.PSObject.Properties['LogMaxSizeKilobytes'] -and $null -ne $Profile.LogMaxSizeKilobytes) { [uint64]$Profile.LogMaxSizeKilobytes } else { $null }
+        LogFileName                     = if ($Profile.PSObject.Properties['LogFileName'] -and -not [string]::IsNullOrWhiteSpace([string]$Profile.LogFileName)) { [string]$Profile.LogFileName } else { $null }
+    }
+}
+
+function Normalize-FirewallProfileState {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            CaptureIssues    = @()
+            Profiles         = @()
+        }
+    }
+
+    $profiles = if ($State.PSObject.Properties['Profiles']) { @($State.Profiles) } else { @($State) }
+    $captureIssues = @()
+    if ($State.PSObject.Properties['CaptureIssues']) {
+        $captureIssues = @(
+            foreach ($issue in @($State.CaptureIssues)) {
+                if ($null -eq $issue) {
+                    continue
+                }
+
+                [PSCustomObject]@{
+                    Profile = if ($issue.PSObject.Properties['Profile']) { [string]$issue.Profile } else { $null }
+                    Message = if ($issue.PSObject.Properties['Message']) { [string]$issue.Message } else { $null }
+                }
+            }
+        )
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable = if ($State.PSObject.Properties['CommandAvailable']) { [bool]$State.CommandAvailable } else { $true }
+        CaptureIssues    = @($captureIssues)
+        Profiles         = @(
+            foreach ($profile in @($profiles)) {
+                Normalize-FirewallProfileEntry -Profile $profile
+            }
+        )
+    }
+}
+
+function Test-FirewallProfileStateHasExtendedFields {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State) {
+        return $false
+    }
+
+    if ($State.PSObject.Properties['CommandAvailable'] -or $State.PSObject.Properties['CaptureIssues']) {
+        return $true
+    }
+
+    $profiles = if ($State.PSObject.Properties['Profiles']) { @($State.Profiles) } else { @($State) }
+    foreach ($profile in @($profiles)) {
+        if ($null -eq $profile) {
+            continue
+        }
+
+        foreach ($propertyName in @('DefaultInboundAction', 'DefaultOutboundAction', 'AllowUnicastResponseToMulticast', 'NotifyOnListen', 'LogAllowed', 'LogBlocked', 'LogIgnored', 'LogMaxSizeKilobytes', 'LogFileName')) {
+            if ($profile.PSObject.Properties[$propertyName]) {
+                return $true
+            }
+        }
+    }
+
+    $false
+}
+
+function Test-FirewallProfileStateCapturedExactly {
+    param([AllowNull()] [object]$State)
+
+    $normalized = Normalize-FirewallProfileState -State $State
+    $normalized.CommandAvailable -and (@($normalized.CaptureIssues).Count -eq 0) -and (@($normalized.Profiles).Count -gt 0)
+}
+
+function Get-FirewallProfileStates {
+    param([string[]]$Profiles)
+
+    if (-not (Test-CommandAvailable -Name 'Get-NetFirewallProfile')) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            CaptureIssues    = @()
+            Profiles         = @()
+        }
+    }
+
+    $captureIssues = [System.Collections.Generic.List[object]]::new()
+    $states = foreach ($profileName in @($Profiles)) {
+        $profile = Get-NetFirewallProfile -Profile $profileName -ErrorAction SilentlyContinue
+        if ($null -eq $profile) {
+            $captureIssues.Add((New-FirewallProfileCaptureIssue -Profile $profileName -Message 'Get-NetFirewallProfile did not return this profile.')) | Out-Null
+            continue
+        }
+
+        Normalize-FirewallProfileEntry -Profile ([PSCustomObject]@{
+            Profile                         = $profileName
+            Enabled                         = $profile.Enabled
+            DefaultInboundAction            = $profile.DefaultInboundAction
+            DefaultOutboundAction           = $profile.DefaultOutboundAction
+            AllowUnicastResponseToMulticast = $profile.AllowUnicastResponseToMulticast
+            NotifyOnListen                  = $profile.NotifyOnListen
+            LogAllowed                      = $profile.LogAllowed
+            LogBlocked                      = $profile.LogBlocked
+            LogIgnored                      = $profile.LogIgnored
+            LogMaxSizeKilobytes             = $profile.LogMaxSizeKilobytes
+            LogFileName                     = $profile.LogFileName
+        })
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable = $true
+        CaptureIssues    = @($captureIssues)
+        Profiles         = @($states)
+    }
+}
+
+function Set-FirewallProfileStateExact {
+    param([Parameter(Mandatory)] [object]$ProfileState)
+
+    if (-not (Test-CommandAvailable -Name 'Set-NetFirewallProfile')) {
+        return
+    }
+
+    $profile = Normalize-FirewallProfileEntry -Profile $ProfileState
+    $profileName = [string]$profile.Profile
+    if ([string]::IsNullOrWhiteSpace($profileName)) {
+        return
+    }
+
+    $params = @{
+        Profile = $profileName
+    }
+
+    if ($null -ne $profile.Enabled) {
+        $params['Enabled'] = $profile.Enabled
+    }
+
+    foreach ($propertyName in @('DefaultInboundAction', 'DefaultOutboundAction', 'AllowUnicastResponseToMulticast', 'NotifyOnListen', 'LogAllowed', 'LogBlocked', 'LogIgnored')) {
+        $value = $profile.$propertyName
+        if ($null -ne $value -and -not [string]::IsNullOrWhiteSpace([string]$value)) {
+            $params[$propertyName] = [string]$value
+        }
+    }
+
+    if ($null -ne $profile.LogMaxSizeKilobytes) {
+        $params['LogMaxSizeKilobytes'] = [uint64]$profile.LogMaxSizeKilobytes
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace([string]$profile.LogFileName)) {
+        $params['LogFileName'] = [string]$profile.LogFileName
+    }
+
+    Set-NetFirewallProfile @params
+}
+
+function Set-Permissive-FirewallProfiles {
+    param([Parameter(Mandatory)] [object]$Definition)
+
+    if (-not (Test-CommandAvailable -Name 'Set-NetFirewallProfile')) {
+        return
+    }
+
+    foreach ($profileName in @($Definition.Profiles)) {
+        Set-NetFirewallProfile -Profile $profileName `
+            -Enabled (ConvertTo-FirewallProfileEnabledValue -Value $Definition.PermissiveValue) `
+            -DefaultInboundAction $Definition.PermissiveDefaultInboundAction `
+            -DefaultOutboundAction $Definition.PermissiveDefaultOutboundAction `
+            -AllowUnicastResponseToMulticast (ConvertTo-FirewallProfileTriStateValue -Value $Definition.PermissiveAllowUnicastResponseToMulticast) `
+            -NotifyOnListen (ConvertTo-FirewallProfileTriStateValue -Value $Definition.PermissiveNotifyOnListen) `
+            -LogAllowed (ConvertTo-FirewallProfileTriStateValue -Value $Definition.PermissiveLogAllowed) `
+            -LogBlocked (ConvertTo-FirewallProfileTriStateValue -Value $Definition.PermissiveLogBlocked) `
+            -LogIgnored (ConvertTo-FirewallProfileTriStateValue -Value $Definition.PermissiveLogIgnored)
+    }
+}
+
+function Restore-FirewallProfiles {
+    param([AllowNull()] [object]$State)
+
+    if (-not (Test-FirewallProfileStateCapturedExactly -State $State)) {
+        return
+    }
+
+    foreach ($profile in @((Normalize-FirewallProfileState -State $State).Profiles)) {
+        Set-FirewallProfileStateExact -ProfileState $profile
+    }
+}
+
+function ConvertTo-ComparableFirewallProfileState {
+    param(
+        [AllowNull()] [object]$State,
+        [AllowNull()] [object]$ReferenceState
+    )
+
+    $normalizedState = Normalize-FirewallProfileState -State $State
+    $comparisonReference = if ($null -ne $ReferenceState) { $ReferenceState } else { $State }
+    $useExtendedFields = Test-FirewallProfileStateHasExtendedFields -State $comparisonReference
+
+    if (-not $useExtendedFields) {
+        return @(
+            foreach ($profile in @($normalizedState.Profiles | Sort-Object -Property Profile)) {
+                [PSCustomObject]@{
+                    Profile = [string]$profile.Profile
+                    Enabled = if ($null -ne $profile.Enabled) { [string]$profile.Enabled } else { $null }
+                }
+            }
+        )
+    }
+
+    [ordered]@{
+        CommandAvailable = $normalizedState.CommandAvailable
+        CaptureIssues    = @(
+            foreach ($issue in @($normalizedState.CaptureIssues | Sort-Object -Property Profile, Message)) {
+                [PSCustomObject]@{
+                    Profile = if (-not [string]::IsNullOrWhiteSpace([string]$issue.Profile)) { [string]$issue.Profile } else { $null }
+                    Message = if (-not [string]::IsNullOrWhiteSpace([string]$issue.Message)) { [string]$issue.Message } else { $null }
+                }
+            }
+        )
+        Profiles         = @(
+            foreach ($profile in @($normalizedState.Profiles | Sort-Object -Property Profile)) {
+                [PSCustomObject]@{
+                    Profile                         = [string]$profile.Profile
+                    Enabled                         = if ($null -ne $profile.Enabled) { [string]$profile.Enabled } else { $null }
+                    DefaultInboundAction            = if ($null -ne $profile.DefaultInboundAction) { [string]$profile.DefaultInboundAction } else { $null }
+                    DefaultOutboundAction           = if ($null -ne $profile.DefaultOutboundAction) { [string]$profile.DefaultOutboundAction } else { $null }
+                    AllowUnicastResponseToMulticast = if ($null -ne $profile.AllowUnicastResponseToMulticast) { [string]$profile.AllowUnicastResponseToMulticast } else { $null }
+                    NotifyOnListen                  = if ($null -ne $profile.NotifyOnListen) { [string]$profile.NotifyOnListen } else { $null }
+                    LogAllowed                      = if ($null -ne $profile.LogAllowed) { [string]$profile.LogAllowed } else { $null }
+                    LogBlocked                      = if ($null -ne $profile.LogBlocked) { [string]$profile.LogBlocked } else { $null }
+                    LogIgnored                      = if ($null -ne $profile.LogIgnored) { [string]$profile.LogIgnored } else { $null }
+                    LogMaxSizeKilobytes             = $profile.LogMaxSizeKilobytes
+                    LogFileName                     = if ($null -ne $profile.LogFileName) { [string]$profile.LogFileName } else { $null }
+                }
+            }
+        )
+    }
+}
+
+function New-FirewallRuleCaptureIssue {
+    param(
+        [string]$Group,
+        [Parameter(Mandatory)] [string]$Message
+    )
+
+    [PSCustomObject]@{
+        Group   = $Group
+        Message = $Message
+    }
+}
+
+function Normalize-FirewallRuleEntry {
+    param([AllowNull()] [object]$Rule)
+
+    if ($null -eq $Rule) {
+        return $null
+    }
+
+    [PSCustomObject]@{
+        Name        = if ($Rule.PSObject.Properties['Name']) { [string]$Rule.Name } else { $null }
+        DisplayName = if ($Rule.PSObject.Properties['DisplayName']) { [string]$Rule.DisplayName } else { $null }
+        Group       = if ($Rule.PSObject.Properties['Group']) { [string]$Rule.Group } elseif ($Rule.PSObject.Properties['RuleGroup']) { [string]$Rule.RuleGroup } else { $null }
+        Enabled     = if ($Rule.PSObject.Properties['Enabled']) { ConvertTo-FirewallProfileEnabledValue -Value $Rule.Enabled } else { $null }
+        Direction   = if ($Rule.PSObject.Properties['Direction']) { [string]$Rule.Direction } else { $null }
+        Action      = if ($Rule.PSObject.Properties['Action']) { [string]$Rule.Action } else { $null }
+        Profile     = if ($Rule.PSObject.Properties['Profile']) { [string]$Rule.Profile } else { $null }
+    }
+}
+
+function Normalize-FirewallRuleState {
+    param([AllowNull()] [object]$State)
+
+    if ($null -eq $State) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            Group            = $null
+            CaptureIssues    = @()
+            Rules            = @()
+        }
+    }
+
+    $rules = if ($State.PSObject.Properties['Rules']) { @($State.Rules) } else { @($State) }
+    $captureIssues = @()
+    if ($State.PSObject.Properties['CaptureIssues']) {
+        $captureIssues = @(
+            foreach ($issue in @($State.CaptureIssues)) {
+                if ($null -eq $issue) {
+                    continue
+                }
+
+                [PSCustomObject]@{
+                    Group   = if ($issue.PSObject.Properties['Group']) { [string]$issue.Group } else { $null }
+                    Message = if ($issue.PSObject.Properties['Message']) { [string]$issue.Message } else { $null }
+                }
+            }
+        )
+    }
+
+    [PSCustomObject]@{
+        CommandAvailable = if ($State.PSObject.Properties['CommandAvailable']) { [bool]$State.CommandAvailable } else { $true }
+        Group            = if ($State.PSObject.Properties['Group']) { [string]$State.Group } else { $null }
+        CaptureIssues    = @($captureIssues)
+        Rules            = @(
+            foreach ($rule in @($rules)) {
+                Normalize-FirewallRuleEntry -Rule $rule
+            }
+        )
+    }
+}
+
+function Test-FirewallRuleStateCapturedExactly {
+    param([AllowNull()] [object]$State)
+
+    $normalized = Normalize-FirewallRuleState -State $State
+    $normalized.CommandAvailable -and (@($normalized.CaptureIssues).Count -eq 0)
+}
+
+function Get-FirewallRuleGroupState {
+    param([Parameter(Mandatory)] [string]$Group)
+
+    if (-not (Test-CommandAvailable -Name 'Get-NetFirewallRule')) {
+        return [PSCustomObject]@{
+            CommandAvailable = $false
+            Group            = $Group
+            CaptureIssues    = @()
+            Rules            = @()
+        }
+    }
+
+    try {
+        $rules = @(
+            foreach ($rule in @(Get-NetFirewallRule -Group $Group -ErrorAction Stop)) {
+                Normalize-FirewallRuleEntry -Rule ([PSCustomObject]@{
+                    Name        = $rule.Name
+                    DisplayName = $rule.DisplayName
+                    Group       = $rule.Group
+                    Enabled     = $rule.Enabled
+                    Direction   = $rule.Direction
+                    Action      = $rule.Action
+                    Profile     = $rule.Profile
+                })
+            }
+        )
+
+        return [PSCustomObject]@{
+            CommandAvailable = $true
+            Group            = $Group
+            CaptureIssues    = @()
+            Rules            = @($rules)
+        }
+    } catch {
+        return [PSCustomObject]@{
+            CommandAvailable = $true
+            Group            = $Group
+            CaptureIssues    = @(
+                New-FirewallRuleCaptureIssue -Group $Group -Message $_.Exception.Message
+            )
+            Rules            = @()
+        }
+    }
+}
+
+function Set-Permissive-FirewallRules {
+    param([Parameter(Mandatory)] [object]$Definition)
+
+    if (-not (Test-CommandAvailable -Name 'Set-NetFirewallRule')) {
+        return
+    }
+
+    Set-NetFirewallRule -Group $Definition.Group -Enabled (ConvertTo-FirewallProfileEnabledValue -Value $Definition.PermissiveEnabled) -ErrorAction SilentlyContinue | Out-Null
+}
+
+function Restore-FirewallRules {
+    param([AllowNull()] [object]$State)
+
+    if (-not (Test-FirewallRuleStateCapturedExactly -State $State)) {
+        return
+    }
+
+    if (-not (Test-CommandAvailable -Name 'Set-NetFirewallRule')) {
+        return
+    }
+
+    foreach ($rule in @((Normalize-FirewallRuleState -State $State).Rules)) {
+        if ([string]::IsNullOrWhiteSpace([string]$rule.Name) -or $null -eq $rule.Enabled) {
+            continue
+        }
+
+        Set-NetFirewallRule -Name $rule.Name -Enabled (ConvertTo-FirewallProfileEnabledValue -Value $rule.Enabled) -ErrorAction SilentlyContinue | Out-Null
+    }
+}
+
+function ConvertTo-ComparableFirewallRuleState {
+    param([AllowNull()] [object]$State)
+
+    $normalizedState = Normalize-FirewallRuleState -State $State
+    [ordered]@{
+        CommandAvailable = $normalizedState.CommandAvailable
+        Group            = if (-not [string]::IsNullOrWhiteSpace([string]$normalizedState.Group)) { [string]$normalizedState.Group } else { $null }
+        CaptureIssues    = @(
+            foreach ($issue in @($normalizedState.CaptureIssues | Sort-Object -Property Group, Message)) {
+                [PSCustomObject]@{
+                    Group   = if (-not [string]::IsNullOrWhiteSpace([string]$issue.Group)) { [string]$issue.Group } else { $null }
+                    Message = if (-not [string]::IsNullOrWhiteSpace([string]$issue.Message)) { [string]$issue.Message } else { $null }
+                }
+            }
+        )
+        Rules            = @(
+            foreach ($rule in @($normalizedState.Rules | Sort-Object -Property Name, DisplayName, Direction, Action, Profile)) {
+                [PSCustomObject]@{
+                    Name        = if (-not [string]::IsNullOrWhiteSpace([string]$rule.Name)) { [string]$rule.Name } else { $null }
+                    DisplayName = if (-not [string]::IsNullOrWhiteSpace([string]$rule.DisplayName)) { [string]$rule.DisplayName } else { $null }
+                    Group       = if (-not [string]::IsNullOrWhiteSpace([string]$rule.Group)) { [string]$rule.Group } else { $null }
+                    Enabled     = if ($null -ne $rule.Enabled) { [string]$rule.Enabled } else { $null }
+                    Direction   = if (-not [string]::IsNullOrWhiteSpace([string]$rule.Direction)) { [string]$rule.Direction } else { $null }
+                    Action      = if (-not [string]::IsNullOrWhiteSpace([string]$rule.Action)) { [string]$rule.Action } else { $null }
+                    Profile     = if (-not [string]::IsNullOrWhiteSpace([string]$rule.Profile)) { [string]$rule.Profile } else { $null }
+                }
+            }
+        )
+    }
+}
+
 function ConvertTo-CanonicalValue {
     param([AllowNull()] [object]$Value)
 
@@ -2254,20 +4244,90 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Current value' -Value $Entry.CurrentValue
             Add-ReportKeyValueLine -Lines $Lines -Label 'Restore value' -Value $Entry.RestoreValue
         }
-        'BitLockerVolumes' {
-            $timedOutMountPoints = @(Get-BitLockerTimedOutMountPoints -State $Entry.CurrentValue)
-            $capturedVolumes = @($Entry.CurrentValue.Volumes)
+        'MpPreferenceList' {
+            $commandAvailable = if ($Entry.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CommandAvailable } else { $true }
+            $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
+            $items = @(Normalize-MpPreferenceListItems -Value $Entry.CurrentValue)
 
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value (Get-BitLockerCommandAvailableFlag -State $Entry.CurrentValue)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Property' -Value $Entry.Property
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $commandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($commandAvailable -and $captured) { 'Complete' } else { 'Partial / incomplete' })
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Item count' -Value $items.Count
+            if ($Entry.PSObject.Properties['CaptureError'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.CaptureError)) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Capture error' -Value $Entry.CaptureError
+            }
+            Add-ReportJsonBlock -Lines $Lines -Label 'Items' -Value @($items)
+        }
+        'DefenderRuntimeStatus' {
+            $state = if ($null -ne $Entry.CurrentValue) { $Entry.CurrentValue } else { [PSCustomObject]@{} }
+            $commandAvailable = if ($state.PSObject.Properties['CommandAvailable']) { [bool]$state.CommandAvailable } else { $true }
+            $captured = if ($state.PSObject.Properties['Captured']) { [bool]$state.Captured } else { $true }
+            $amRunningMode = if ($state.PSObject.Properties['AMRunningMode']) { [string]$state.AMRunningMode } else { $null }
+            $realTimeProtectionEnabled = if ($state.PSObject.Properties['RealTimeProtectionEnabled']) { ConvertTo-NullableBoolean -Value $state.RealTimeProtectionEnabled } else { $null }
+            $antivirusEnabled = if ($state.PSObject.Properties['AntivirusEnabled']) { ConvertTo-NullableBoolean -Value $state.AntivirusEnabled } else { $null }
+            $isTamperProtected = if ($state.PSObject.Properties['IsTamperProtected']) { ConvertTo-NullableBoolean -Value $state.IsTamperProtected } else { $null }
+
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $commandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($commandAvailable -and $captured) { 'Complete' } else { 'Partial / incomplete' })
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Running mode' -Value $amRunningMode
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Real-time protection enabled' -Value $realTimeProtectionEnabled
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Antivirus enabled' -Value $antivirusEnabled
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Tamper protection' -Value $isTamperProtected
+            if ($state.PSObject.Properties['Error'] -and -not [string]::IsNullOrWhiteSpace([string]$state.Error)) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Capture error' -Value $state.Error
+            }
+            if ($captured -and ($isTamperProtected -eq $true -or $amRunningMode -match 'Passive')) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'Tamper protection can cause local Defender preference changes to be ignored or later reverted, and passive mode means Defender Antivirus is not the primary enforcement engine. Interpret Defender restore mismatches in that context.'
+            }
+        }
+        'BitLockerVolumes' {
+            $state = Normalize-BitLockerState -State $Entry.CurrentValue
+            $timedOutMountPoints = @($state.TimedOutMountPoints)
+            $captureIssues = @($state.CaptureIssues)
+            $capturedVolumes = @($state.Volumes)
+            $baselineComplete = Test-BitLockerStateCapturedExactly -State $state
+
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $state.CommandAvailable
             Add-ReportKeyValueLine -Lines $Lines -Label 'Timed out mount point count' -Value $timedOutMountPoints.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Capture issue count' -Value $captureIssues.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($baselineComplete) { 'Complete' } else { 'Partial / incomplete' })
+            if (-not $baselineComplete) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'BitLocker round-trip requires an exact mounted-volume baseline. Permissive, restore, and verification skip this setting if mount points time out or richer BitLocker fields cannot be captured exactly.'
+            }
             if ($timedOutMountPoints.Count -gt 0) {
                 foreach ($mountPoint in $timedOutMountPoints) {
                     $Lines.Add(('  - Timed out mount point: {0}' -f $mountPoint))
                 }
             }
+            foreach ($issue in @($captureIssues | Sort-Object -Property MountPoint, Message)) {
+                $issueMountPoint = if (-not [string]::IsNullOrWhiteSpace([string]$issue.MountPoint)) { [string]$issue.MountPoint } else { '<unknown>' }
+                $Lines.Add(('  - Capture issue | MountPoint={0} | {1}' -f $issueMountPoint, $issue.Message))
+            }
             Add-ReportKeyValueLine -Lines $Lines -Label 'Captured volume count' -Value $capturedVolumes.Count
-            foreach ($volume in $capturedVolumes) {
-                $Lines.Add(('  - {0} | Protection={1} | Status={2} | Encryption={3}% | Protectors={4}' -f $volume.MountPoint, $volume.ProtectionStatus, $volume.VolumeStatus, $volume.EncryptionPercentage, $volume.KeyProtectorCount))
+            foreach ($volume in @($capturedVolumes | Sort-Object -Property MountPoint)) {
+                $mountPoint = if (-not [string]::IsNullOrWhiteSpace([string]$volume.MountPoint)) { [string]$volume.MountPoint } else { '<unknown>' }
+                $protectionMode = if (-not [string]::IsNullOrWhiteSpace([string]$volume.ProtectionMode)) { [string]$volume.ProtectionMode } else { '<unknown>' }
+                $volumeStatus = if (-not [string]::IsNullOrWhiteSpace([string]$volume.VolumeStatus)) { [string]$volume.VolumeStatus } else { '<unknown>' }
+                $lockStatus = if (-not [string]::IsNullOrWhiteSpace([string]$volume.LockStatus)) { [string]$volume.LockStatus } else { '<unknown>' }
+                $encryptionMethod = if (-not [string]::IsNullOrWhiteSpace([string]$volume.EncryptionMethod)) { [string]$volume.EncryptionMethod } else { '<unknown>' }
+                $encryptionSummary = if ($null -ne $volume.EncryptionPercentage) {
+                    ('{0}% ({1})' -f ([int]$volume.EncryptionPercentage), $encryptionMethod)
+                } else {
+                    $encryptionMethod
+                }
+                $protectorCount = if ($null -ne $volume.KeyProtectorCount) { [int]$volume.KeyProtectorCount } else { '<unknown>' }
+                $protectorSummary = Get-BitLockerProtectorTypeSummary -Volume $volume
+                $autoUnlockSummary = if (Test-BitLockerAutoUnlockSupportedVolume -Volume $volume) {
+                    if ($null -ne $volume.AutoUnlockEnabled) {
+                        ConvertTo-DisplayString -Value $volume.AutoUnlockEnabled
+                    } else {
+                        '<unknown>'
+                    }
+                } else {
+                    'n/a'
+                }
+
+                $Lines.Add(('  - {0} | Mode={1} | Protection={2} | Status={3} | Lock={4} | Encryption={5} | Protectors={6} [{7}] | AutoUnlock={8}' -f $mountPoint, $protectionMode, $volume.ProtectionStatus, $volumeStatus, $lockStatus, $encryptionSummary, $protectorCount, $protectorSummary, $autoUnlockSummary))
             }
         }
         'ExploitProtectionPolicy' {
@@ -2278,17 +4338,23 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'CiTool available' -Value $Entry.CurrentValue.CiToolAvailable
             Add-ReportKeyValueLine -Lines $Lines -Label 'Policy count' -Value @($Entry.CurrentValue.Policies).Count
             Add-ReportKeyValueLine -Lines $Lines -Label 'Policy file count' -Value @($Entry.CurrentValue.Files).Count
-            $platformManagedPolicies = @(Get-WdacPlatformManagedPolicies -State $Entry.CurrentValue)
+            $policyRows = @(Get-WdacPolicyReportRows -State $Entry.CurrentValue)
+            $platformManagedPolicies = @($policyRows | Where-Object { $_.IsPlatformManaged })
+            $activePolicies = @($policyRows | Where-Object { $_.IsEnforced -eq $true })
+            $onDiskOnlyPolicies = @($policyRows | Where-Object { $_.HasFileOnDisk -eq $true -and $_.IsEnforced -eq $false })
+            $activeOnlyPolicies = @($policyRows | Where-Object { $_.HasFileOnDisk -eq $false -and $_.IsEnforced -eq $true })
             Add-ReportKeyValueLine -Lines $Lines -Label 'Platform-managed policy count' -Value $platformManagedPolicies.Count
-            if ($platformManagedPolicies.Count -gt 0) {
-                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'Inbox or platform-managed WDAC policies are tracked for state awareness, but they may require file-based handling or a reboot and may not behave like ordinary custom WDAC policies during testing.'
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Active policy count' -Value $activePolicies.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'On-disk only / pending reboot count' -Value $onDiskOnlyPolicies.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Active-only policy count' -Value $activeOnlyPolicies.Count
+            if ($platformManagedPolicies.Count -gt 0 -or $onDiskOnlyPolicies.Count -gt 0) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'WDAC reporting distinguishes active enforcement from on-disk file presence. On-disk-only policies usually indicate pending-reboot state, and platform-managed policies can require file-based handling or a reboot before live WDAC state fully matches the snapshot.'
             }
-            foreach ($policy in @($Entry.CurrentValue.Policies)) {
-                $policyInfo = Get-WdacPolicyPlatformManagementInfo -Policy $policy
-                if ($policyInfo.IsPlatformManaged) {
-                    $Lines.Add(('  - {0} | {1} | {2} [platform-managed]' -f $policyInfo.PolicyId, $policyInfo.FriendlyName, $policyInfo.Classification))
+            foreach ($policyRow in $policyRows) {
+                if ($policyRow.IsPlatformManaged) {
+                    $Lines.Add(('  - {0} | {1} | {2} | Enforced={3} | FileOnDisk={4} | {5} [platform-managed]' -f $policyRow.PolicyId, $policyRow.FriendlyName, $policyRow.Presence, (ConvertTo-DisplayString -Value $policyRow.IsEnforced), (ConvertTo-DisplayString -Value $policyRow.HasFileOnDisk), $policyRow.Classification))
                 } else {
-                    $Lines.Add(('  - {0} | {1}' -f $policyInfo.PolicyId, $policyInfo.FriendlyName))
+                    $Lines.Add(('  - {0} | {1} | {2} | Enforced={3} | FileOnDisk={4}' -f $policyRow.PolicyId, $policyRow.FriendlyName, $policyRow.Presence, (ConvertTo-DisplayString -Value $policyRow.IsEnforced), (ConvertTo-DisplayString -Value $policyRow.HasFileOnDisk)))
                 }
             }
         }
@@ -2322,9 +4388,77 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Module names key exists' -Value $Entry.CurrentValue.ModuleNamesExists
             Add-ReportJsonBlock -Lines $Lines -Label 'Module names values' -Value @($Entry.CurrentValue.ModuleNamesValues)
         }
+        'AppLockerPolicy' {
+            $state = $Entry.CurrentValue
+            $commandAvailable = if ($state.PSObject.Properties['CommandAvailable']) { [bool]$state.CommandAvailable } else { $true }
+            $localCaptured = if ($state.PSObject.Properties['LocalCaptured']) { [bool]$state.LocalCaptured } else { $false }
+            $effectiveCaptured = if ($state.PSObject.Properties['EffectiveCaptured']) { [bool]$state.EffectiveCaptured } else { $false }
+            $localMatchesEffective = if ($state.PSObject.Properties['LocalMatchesEffective']) { [bool]$state.LocalMatchesEffective } else { $false }
+            $captureIssues = if ($state.PSObject.Properties['CaptureIssues']) { @($state.CaptureIssues) } else { @() }
+            $collectionSummaries = if ($state.PSObject.Properties['CollectionSummaries']) { @($state.CollectionSummaries) } else { @(Get-AppLockerCollectionSummaries -Xml (Get-AppLockerPolicyXml -State $state -PolicyScope Effective -SnapshotPath $SnapshotPath)) }
+            $baselineComplete = Test-AppLockerPolicyCapturedExactly -State $state -SnapshotPath $SnapshotPath
+
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $commandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Local policy captured' -Value $localCaptured
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Effective policy captured' -Value $effectiveCaptured
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Local matches effective' -Value $localMatchesEffective
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Collection count' -Value $collectionSummaries.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Capture issue count' -Value $captureIssues.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($baselineComplete) { 'Complete' } else { 'Partial / incomplete' })
+            if (-not $baselineComplete) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'AppLocker round-trip is only treated as exact when the local and effective AppLocker policies match. If Group Policy or another higher-precedence source changes the effective policy, permissive, restore, and verification skip this entry rather than guessing.'
+            }
+
+            foreach ($issue in @($captureIssues | Sort-Object -Property Scope, Message)) {
+                $scope = if ($issue.PSObject.Properties['Scope'] -and -not [string]::IsNullOrWhiteSpace([string]$issue.Scope)) { [string]$issue.Scope } else { '<unknown>' }
+                $Lines.Add(('  - Capture issue | Scope={0} | {1}' -f $scope, $issue.Message))
+            }
+
+            foreach ($collection in @($collectionSummaries | Sort-Object -Property Type)) {
+                $Lines.Add(('  - {0} | Enforcement={1} | Rules={2} | Services={3} | SystemApps={4}' -f (ConvertTo-DisplayString -Value $collection.Type), (ConvertTo-DisplayString -Value $collection.EnforcementMode), (ConvertTo-DisplayString -Value $collection.RuleCount), (ConvertTo-DisplayString -Value $collection.ServicesEnforcement), (ConvertTo-DisplayString -Value $collection.SystemAppsAllow)))
+            }
+        }
         'FirewallProfiles' {
-            foreach ($profile in @($Entry.CurrentValue)) {
-                $Lines.Add(('  - {0}: {1}' -f $profile.Profile, $profile.Enabled))
+            $state = Normalize-FirewallProfileState -State $Entry.CurrentValue
+            $baselineComplete = Test-FirewallProfileStateCapturedExactly -State $state
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $state.CommandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Captured profile count' -Value (@($state.Profiles).Count)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Capture issue count' -Value (@($state.CaptureIssues).Count)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($baselineComplete) { 'Complete' } else { 'Partial / incomplete' })
+            if (-not $baselineComplete) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'Firewall round-trip requires an exact per-profile baseline. Permissive, restore, and verification skip this setting if a profile cannot be captured exactly.'
+            }
+
+            foreach ($issue in @($state.CaptureIssues | Sort-Object -Property Profile, Message)) {
+                $issueProfile = if (-not [string]::IsNullOrWhiteSpace([string]$issue.Profile)) { [string]$issue.Profile } else { '<unknown>' }
+                $Lines.Add(('  - Capture issue | Profile={0} | {1}' -f $issueProfile, $issue.Message))
+            }
+
+            foreach ($profile in @($state.Profiles | Sort-Object -Property Profile)) {
+                $Lines.Add(('  - {0} | Enabled={1} | Inbound={2} | Outbound={3} | Notify={4} | Unicast={5} | LogAllowed={6} | LogBlocked={7} | LogIgnored={8} | LogMaxKB={9} | LogFile={10}' -f $profile.Profile, (ConvertTo-DisplayString -Value $profile.Enabled), (ConvertTo-DisplayString -Value $profile.DefaultInboundAction), (ConvertTo-DisplayString -Value $profile.DefaultOutboundAction), (ConvertTo-DisplayString -Value $profile.NotifyOnListen), (ConvertTo-DisplayString -Value $profile.AllowUnicastResponseToMulticast), (ConvertTo-DisplayString -Value $profile.LogAllowed), (ConvertTo-DisplayString -Value $profile.LogBlocked), (ConvertTo-DisplayString -Value $profile.LogIgnored), (ConvertTo-DisplayString -Value $profile.LogMaxSizeKilobytes), (ConvertTo-DisplayString -Value $profile.LogFileName)))
+            }
+        }
+        'FirewallRules' {
+            $state = Normalize-FirewallRuleState -State $Entry.CurrentValue
+            $baselineComplete = Test-FirewallRuleStateCapturedExactly -State $state
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $state.CommandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Group' -Value $state.Group
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Rule count' -Value (@($state.Rules).Count)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Capture issue count' -Value (@($state.CaptureIssues).Count)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($baselineComplete) { 'Complete' } else { 'Partial / incomplete' })
+            if (-not $baselineComplete) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'Firewall rule group round-trip requires an exact baseline. Permissive, restore, and verification skip this setting if the rule group cannot be captured exactly.'
+            }
+
+            foreach ($issue in @($state.CaptureIssues | Sort-Object -Property Group, Message)) {
+                $issueGroup = if (-not [string]::IsNullOrWhiteSpace([string]$issue.Group)) { [string]$issue.Group } else { '<unknown>' }
+                $Lines.Add(('  - Capture issue | Group={0} | {1}' -f $issueGroup, $issue.Message))
+            }
+
+            foreach ($rule in @($state.Rules | Sort-Object -Property Name, DisplayName)) {
+                $displayName = if (-not [string]::IsNullOrWhiteSpace([string]$rule.DisplayName)) { [string]$rule.DisplayName } else { '<unnamed>' }
+                $ruleName = if (-not [string]::IsNullOrWhiteSpace([string]$rule.Name)) { [string]$rule.Name } else { '<unknown>' }
+                $Lines.Add(('  - {0} | Name={1} | Enabled={2} | Direction={3} | Action={4} | Profile={5}' -f $displayName, $ruleName, (ConvertTo-DisplayString -Value $rule.Enabled), (ConvertTo-DisplayString -Value $rule.Direction), (ConvertTo-DisplayString -Value $rule.Action), (ConvertTo-DisplayString -Value $rule.Profile)))
             }
         }
         'NetBiosAdapters' {
@@ -2333,9 +4467,23 @@ function Add-SnapshotEntryReportLines {
             }
         }
         'LoadedUserRegistryValues' {
-            foreach ($value in @($Entry.CurrentValue)) {
+            $state = Normalize-UserRegistryValueState -State $Entry.CurrentValue
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Captured profile count' -Value (@($state.Entries | Group-Object -Property Sid).Count)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Capture issue count' -Value (@($state.CaptureIssues).Count)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if (@($state.CaptureIssues).Count -eq 0) { 'Complete' } else { 'Partial / incomplete' })
+            if (@($state.CaptureIssues).Count -gt 0) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'One or more user profile hives could not be accessed. Permissive, restore, and verification will skip this setting to avoid partial round-trip behavior.'
+            }
+
+            foreach ($value in @($state.Entries)) {
                 $displayValue = if ($value.Exists) { ConvertTo-DisplayString -Value $value.CurrentValue } else { '<absent>' }
                 $Lines.Add(('  - {0} | {1} | {2} | {3}' -f $value.Sid, $value.RelativePath, $value.Name, $displayValue))
+            }
+
+            foreach ($issue in @($state.CaptureIssues)) {
+                $profilePath = if ($null -ne $issue.PSObject.Properties['ProfilePath'] -and -not [string]::IsNullOrWhiteSpace([string]$issue.ProfilePath)) { [string]$issue.ProfilePath } else { '<unknown>' }
+                $hivePath = if ($null -ne $issue.PSObject.Properties['HivePath'] -and -not [string]::IsNullOrWhiteSpace([string]$issue.HivePath)) { [string]$issue.HivePath } else { '<unknown>' }
+                $Lines.Add(('  - Capture issue | SID={0} | Profile={1} | Hive={2} | {3}' -f $issue.Sid, $profilePath, $hivePath, $issue.Message))
             }
         }
         'MachineEnvironmentValue' {
@@ -2355,7 +4503,29 @@ function Add-SnapshotEntryReportLines {
         }
         'WsManValue' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Path' -Value $Entry.Path
+            $commandAvailable = if ($Entry.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CommandAvailable } else { $true }
+            $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $commandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($commandAvailable -and $captured) { 'Complete' } else { 'Partial / incomplete' })
             Add-ReportKeyValueLine -Lines $Lines -Label 'Current value' -Value $Entry.CurrentValue
+            if ($Entry.PSObject.Properties['CaptureError'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.CaptureError)) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Capture error' -Value $Entry.CaptureError
+            }
+        }
+        'WinRmListeners' {
+            $commandAvailable = if ($Entry.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CommandAvailable } else { $true }
+            $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
+            $listeners = @($Entry.CurrentValue)
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $commandAvailable
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Listener count' -Value $listeners.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($commandAvailable -and $captured) { 'Complete' } else { 'Partial / incomplete' })
+            if ($Entry.PSObject.Properties['CaptureError'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.CaptureError)) {
+                Add-ReportKeyValueLine -Lines $Lines -Label 'Capture error' -Value $Entry.CaptureError
+            }
+
+            foreach ($listener in $listeners) {
+                $Lines.Add(('  - {0} {1} | Port={2} | Enabled={3} | Hostname={4} | URLPrefix={5} | Cert={6}' -f $listener.Transport, $listener.Address, $listener.Port, $listener.Enabled, (ConvertTo-DisplayString -Value $listener.Hostname), (ConvertTo-DisplayString -Value $listener.URLPrefix), (ConvertTo-DisplayString -Value $listener.CertificateThumbprint)))
+            }
         }
         'AuditPolicy' {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Subcategory' -Value $Entry.Subcategory
@@ -2423,7 +4593,8 @@ function Show-ReportLines {
 function ConvertTo-ComparableSnapshotEntry {
     param(
         [Parameter(Mandatory)] [object]$Entry,
-        [string]$SnapshotPath
+        [string]$SnapshotPath,
+        [AllowNull()] [object]$ReferenceEntry
     )
 
     switch ($Entry.Type) {
@@ -2454,29 +4625,77 @@ function ConvertTo-ComparableSnapshotEntry {
                 RequiresReboot = $Entry.RequiresReboot
             })
         }
-        'BitLockerVolumes' {
-            $timedOutMountPoints = @(Get-BitLockerTimedOutMountPoints -State $Entry.CurrentValue)
+        'MpPreferenceList' {
+            $commandAvailable = if ($Entry.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CommandAvailable } else { $true }
+            $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id               = $Entry.Id
+                Type             = $Entry.Type
+                Property         = $Entry.Property
+                CommandAvailable = $commandAvailable
+                Captured         = $captured
+                CurrentValue     = @(Normalize-MpPreferenceListItems -Value $Entry.CurrentValue)
+                RequiresReboot   = $Entry.RequiresReboot
+            })
+        }
+        'DefenderRuntimeStatus' {
+            $state = if ($null -ne $Entry.CurrentValue) { $Entry.CurrentValue } else { [PSCustomObject]@{} }
             return ConvertTo-CanonicalValue -Value ([ordered]@{
                 Id             = $Entry.Id
                 Type           = $Entry.Type
                 CurrentValue   = [ordered]@{
-                    CommandAvailable    = Get-BitLockerCommandAvailableFlag -State $Entry.CurrentValue
-                    TimedOutMountPoints = @(
-                        foreach ($mountPoint in $timedOutMountPoints) {
-                            [string]$mountPoint
-                        }
-                    )
-                    Volumes             = @(
-                        foreach ($volume in @($Entry.CurrentValue.Volumes)) {
+                    CommandAvailable          = if ($state.PSObject.Properties['CommandAvailable']) { [bool]$state.CommandAvailable } else { $true }
+                    Captured                  = if ($state.PSObject.Properties['Captured']) { [bool]$state.Captured } else { $true }
+                    AMRunningMode             = if ($state.PSObject.Properties['AMRunningMode']) { [string]$state.AMRunningMode } else { $null }
+                    RealTimeProtectionEnabled = if ($state.PSObject.Properties['RealTimeProtectionEnabled']) { ConvertTo-NullableBoolean -Value $state.RealTimeProtectionEnabled } else { $null }
+                    AntivirusEnabled          = if ($state.PSObject.Properties['AntivirusEnabled']) { ConvertTo-NullableBoolean -Value $state.AntivirusEnabled } else { $null }
+                    IsTamperProtected         = if ($state.PSObject.Properties['IsTamperProtected']) { ConvertTo-NullableBoolean -Value $state.IsTamperProtected } else { $null }
+                }
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'BitLockerVolumes' {
+            $referenceState = if ($null -ne $ReferenceEntry -and [string]$ReferenceEntry.Type -eq 'BitLockerVolumes') { $ReferenceEntry.CurrentValue } else { $null }
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = ConvertTo-ComparableBitLockerState -State $Entry.CurrentValue -ReferenceState $referenceState
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'AppLockerPolicy' {
+            $effectiveXml = Normalize-AppLockerXml -Xml (Get-AppLockerPolicyXml -State $Entry.CurrentValue -PolicyScope Effective -SnapshotPath $SnapshotPath)
+            $localXml = Normalize-AppLockerXml -Xml (Get-AppLockerPolicyXml -State $Entry.CurrentValue -PolicyScope Local -SnapshotPath $SnapshotPath)
+            $collectionSummaries = if ($Entry.CurrentValue.PSObject.Properties['CollectionSummaries']) { @($Entry.CurrentValue.CollectionSummaries) } else { @(Get-AppLockerCollectionSummaries -Xml $effectiveXml) }
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = [ordered]@{
+                    CommandAvailable      = if ($Entry.CurrentValue.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CurrentValue.CommandAvailable } else { $true }
+                    LocalCaptured         = if ($Entry.CurrentValue.PSObject.Properties['LocalCaptured']) { [bool]$Entry.CurrentValue.LocalCaptured } else { $false }
+                    EffectiveCaptured     = if ($Entry.CurrentValue.PSObject.Properties['EffectiveCaptured']) { [bool]$Entry.CurrentValue.EffectiveCaptured } else { $false }
+                    LocalMatchesEffective = if ($Entry.CurrentValue.PSObject.Properties['LocalMatchesEffective']) { [bool]$Entry.CurrentValue.LocalMatchesEffective } else { $false }
+                    CaptureIssues         = @(
+                        foreach ($issue in @($Entry.CurrentValue.CaptureIssues | Sort-Object -Property Scope, Message)) {
                             [PSCustomObject]@{
-                                MountPoint           = [string]$volume.MountPoint
-                                ProtectionStatus     = [string]$volume.ProtectionStatus
-                                VolumeStatus         = [string]$volume.VolumeStatus
-                                EncryptionPercentage = $volume.EncryptionPercentage
-                                KeyProtectorCount    = $volume.KeyProtectorCount
+                                Scope   = if ($null -ne $issue.PSObject.Properties['Scope']) { [string]$issue.Scope } else { $null }
+                                Message = if ($null -ne $issue.PSObject.Properties['Message']) { [string]$issue.Message } else { $null }
                             }
                         }
                     )
+                    CollectionSummaries   = @(
+                        foreach ($collection in @($collectionSummaries | Sort-Object -Property Type)) {
+                            [PSCustomObject]@{
+                                Type                = if ($null -ne $collection.PSObject.Properties['Type']) { [string]$collection.Type } else { $null }
+                                EnforcementMode     = if ($null -ne $collection.PSObject.Properties['EnforcementMode']) { [string]$collection.EnforcementMode } else { $null }
+                                RuleCount           = if ($null -ne $collection.PSObject.Properties['RuleCount']) { [int]$collection.RuleCount } else { 0 }
+                                ServicesEnforcement = if ($null -ne $collection.PSObject.Properties['ServicesEnforcement']) { [string]$collection.ServicesEnforcement } else { $null }
+                                SystemAppsAllow     = if ($null -ne $collection.PSObject.Properties['SystemAppsAllow']) { [string]$collection.SystemAppsAllow } else { $null }
+                            }
+                        }
+                    )
+                    EffectiveXml          = $effectiveXml
+                    LocalXml              = $localXml
                 }
                 RequiresReboot = $Entry.RequiresReboot
             })
@@ -2576,17 +4795,19 @@ function ConvertTo-ComparableSnapshotEntry {
             })
         }
         'FirewallProfiles' {
+            $referenceState = if ($null -ne $ReferenceEntry -and [string]$ReferenceEntry.Type -eq 'FirewallProfiles') { $ReferenceEntry.CurrentValue } else { $null }
             return ConvertTo-CanonicalValue -Value ([ordered]@{
                 Id             = $Entry.Id
                 Type           = $Entry.Type
-                CurrentValue   = @(
-                    foreach ($profile in @($Entry.CurrentValue)) {
-                        [PSCustomObject]@{
-                            Profile = $profile.Profile
-                            Enabled = [bool]$profile.Enabled
-                        }
-                    }
-                )
+                CurrentValue   = ConvertTo-ComparableFirewallProfileState -State $Entry.CurrentValue -ReferenceState $referenceState
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'FirewallRules' {
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CurrentValue   = ConvertTo-ComparableFirewallRuleState -State $Entry.CurrentValue
                 RequiresReboot = $Entry.RequiresReboot
             })
         }
@@ -2606,18 +4827,63 @@ function ConvertTo-ComparableSnapshotEntry {
             })
         }
         'LoadedUserRegistryValues' {
+            $state = Normalize-UserRegistryValueState -State $Entry.CurrentValue
             return ConvertTo-CanonicalValue -Value ([ordered]@{
                 Id             = $Entry.Id
                 Type           = $Entry.Type
+                CurrentValue   = [ordered]@{
+                    Entries       = @(
+                        foreach ($value in @($state.Entries | Sort-Object -Property Sid, RelativePath, Name)) {
+                            [PSCustomObject]@{
+                                Sid          = $value.Sid
+                                RelativePath = $value.RelativePath
+                                Name         = $value.Name
+                                Exists       = $value.Exists
+                                CurrentValue = $value.CurrentValue
+                                ValueKind    = $value.ValueKind
+                            }
+                        }
+                    )
+                    CaptureIssues = @(
+                        foreach ($issue in @($state.CaptureIssues | Sort-Object -Property Sid)) {
+                            [string]$issue.Sid
+                        }
+                    )
+                }
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'WsManValue' {
+            $commandAvailable = if ($Entry.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CommandAvailable } else { $true }
+            $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                Path           = $Entry.Path
+                CommandAvailable = $commandAvailable
+                Captured       = $captured
+                CurrentValue   = $Entry.CurrentValue
+                RequiresReboot = $Entry.RequiresReboot
+            })
+        }
+        'WinRmListeners' {
+            $commandAvailable = if ($Entry.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CommandAvailable } else { $true }
+            $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
+            return ConvertTo-CanonicalValue -Value ([ordered]@{
+                Id             = $Entry.Id
+                Type           = $Entry.Type
+                CommandAvailable = $commandAvailable
+                Captured       = $captured
                 CurrentValue   = @(
-                    foreach ($value in @($Entry.CurrentValue)) {
+                    foreach ($listener in @($Entry.CurrentValue | Sort-Object -Property Address, Transport, Port, Hostname, URLPrefix, CertificateThumbprint)) {
                         [PSCustomObject]@{
-                            Sid          = $value.Sid
-                            RelativePath = $value.RelativePath
-                            Name         = $value.Name
-                            Exists       = $value.Exists
-                            CurrentValue = $value.CurrentValue
-                            ValueKind    = $value.ValueKind
+                            Address               = [string]$listener.Address
+                            Transport             = [string]$listener.Transport
+                            Port                  = if ($null -ne $listener.PSObject.Properties['Port'] -and $null -ne $listener.Port) { [int]$listener.Port } else { $null }
+                            Hostname              = if ($null -ne $listener.PSObject.Properties['Hostname']) { [string]$listener.Hostname } else { $null }
+                            Enabled               = if ($null -ne $listener.PSObject.Properties['Enabled']) { ConvertTo-NullableBoolean -Value $listener.Enabled } else { $null }
+                            URLPrefix             = if ($null -ne $listener.PSObject.Properties['URLPrefix']) { [string]$listener.URLPrefix } else { $null }
+                            CertificateThumbprint = if ($null -ne $listener.PSObject.Properties['CertificateThumbprint']) { [string]$listener.CertificateThumbprint } else { $null }
                         }
                     }
                 )
@@ -2663,8 +4929,17 @@ function Test-SnapshotEntryCapturedExactly {
     )
 
     switch ($Entry.Type) {
+        'MpPreferenceList' {
+            return (Test-MpPreferenceListCapturedExactly -Entry $Entry)
+        }
+        'DefenderRuntimeStatus' {
+            return (Test-DefenderRuntimeStatusCapturedExactly -State $Entry.CurrentValue)
+        }
         'BitLockerVolumes' {
             return (Test-BitLockerStateCapturedExactly -State $Entry.CurrentValue)
+        }
+        'AppLockerPolicy' {
+            return (Test-AppLockerPolicyCapturedExactly -State $Entry.CurrentValue -SnapshotPath $SnapshotPath)
         }
         'ExploitProtectionPolicy' {
             return (Test-ExploitProtectionPolicyCapturedExactly -State $Entry.CurrentValue -SnapshotPath $SnapshotPath)
@@ -2673,6 +4948,12 @@ function Test-SnapshotEntryCapturedExactly {
             $invalidEntries = @(Get-AsrInvalidEntriesFromEntry -Entry $Entry)
             return ($invalidEntries.Count -eq 0)
         }
+        'FirewallProfiles' {
+            return (Test-FirewallProfileStateCapturedExactly -State $Entry.CurrentValue)
+        }
+        'FirewallRules' {
+            return (Test-FirewallRuleStateCapturedExactly -State $Entry.CurrentValue)
+        }
         'SmbClientConfig' {
             $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
             return $state.CommandAvailable -and -not $state.TimedOut -and $null -ne $state.RequireSecuritySignature
@@ -2680,6 +4961,20 @@ function Test-SnapshotEntryCapturedExactly {
         'SmbServerConfig' {
             $state = Normalize-SmbConfigState -Value $Entry.CurrentValue
             return $state.CommandAvailable -and -not $state.TimedOut -and $null -ne $state.RequireSecuritySignature
+        }
+        'LoadedUserRegistryValues' {
+            $state = Normalize-UserRegistryValueState -State $Entry.CurrentValue
+            return (@($state.CaptureIssues).Count -eq 0)
+        }
+        'WsManValue' {
+            $commandAvailable = if ($Entry.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CommandAvailable } else { $true }
+            $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
+            return ($commandAvailable -and $captured)
+        }
+        'WinRmListeners' {
+            $commandAvailable = if ($Entry.PSObject.Properties['CommandAvailable']) { [bool]$Entry.CommandAvailable } else { $true }
+            $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
+            return ($commandAvailable -and $captured)
         }
         default {
             return $true
@@ -2733,7 +5028,7 @@ function Test-DefenseSnapshot {
 
         try {
             $liveEntry = Capture-Definition -Definition $definitions[$entryId]
-            $actualComparable = ConvertTo-ComparableSnapshotEntry -Entry $liveEntry
+            $actualComparable = ConvertTo-ComparableSnapshotEntry -Entry $liveEntry -ReferenceEntry $entry
             $matches = (Get-CanonicalJson -Value $expectedComparable) -eq (Get-CanonicalJson -Value $actualComparable)
 
             $results += [PSCustomObject]@{
@@ -2825,6 +5120,43 @@ function Get-VerificationReportLines {
     [string[]]$lines
 }
 
+function Get-WdacVerificationReportLines {
+    param(
+        [Parameter(Mandatory)] [object]$Verification,
+        [Parameter(Mandatory)] [string]$SnapshotPath
+    )
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $wdacResults = @($Verification.Results | Where-Object { [string]$_.Type -eq 'WdacPolicies' -or [string]$_.Id -eq 'wdac.policies' })
+
+    $lines.Add('WinDefState WDAC Restore Verification')
+    $lines.Add(('Snapshot JSON: {0}' -f $SnapshotPath))
+    $lines.Add(('ComputerName: {0}' -f $Verification.ComputerName))
+    $lines.Add(('VerifiedAtUtc: {0}' -f $Verification.VerifiedAtUtc))
+    $lines.Add(('WDAC result count: {0}' -f $wdacResults.Count))
+
+    if ($wdacResults.Count -eq 0) {
+        $lines.Add(' ')
+        $lines.Add('No WDAC verification entry was present in this verification run.')
+        return [string[]]$lines
+    }
+
+    foreach ($result in $wdacResults) {
+        $lines.Add(' ')
+        $lines.Add("[$($result.Id)] $($result.Type)")
+        Add-ReportKeyValueLine -Lines $lines -Label 'Requires reboot' -Value $result.RequiresReboot
+        Add-ReportKeyValueLine -Lines $lines -Label 'Matches snapshot' -Value $result.Matches
+        Add-ReportKeyValueLine -Lines $lines -Label 'Skipped' -Value $result.Skipped
+        if (-not [string]::IsNullOrWhiteSpace([string]$result.Reason)) {
+            Add-ReportKeyValueLine -Lines $lines -Label 'Reason' -Value $result.Reason
+        }
+        Add-ReportJsonBlock -Lines $lines -Label 'Expected' -Value $result.Expected
+        Add-ReportJsonBlock -Lines $lines -Label 'Actual' -Value $result.Actual
+    }
+
+    [string[]]$lines
+}
+
 function Persist-SnapshotExternalAssets {
     param(
         [Parameter(Mandatory)] [object]$Snapshot,
@@ -2834,6 +5166,33 @@ function Persist-SnapshotExternalAssets {
     $assetRoot = Get-SnapshotAssetRoot -SnapshotPath $SnapshotPath
 
     foreach ($entry in @($Snapshot.Settings)) {
+        if ([string]$entry.Type -eq 'AppLockerPolicy' -and $null -ne $entry.CurrentValue) {
+            $localXml = Get-AppLockerPolicyXml -State $entry.CurrentValue -PolicyScope Local
+            $effectiveXml = Get-AppLockerPolicyXml -State $entry.CurrentValue -PolicyScope Effective
+            $localAssetRelativePath = if (-not [string]::IsNullOrWhiteSpace($localXml)) { Join-Path 'applocker' 'local-policy.xml' } else { $null }
+            $effectiveAssetRelativePath = if (-not [string]::IsNullOrWhiteSpace($effectiveXml)) { Join-Path 'applocker' 'effective-policy.xml' } else { $null }
+
+            if (-not [string]::IsNullOrWhiteSpace($localXml)) {
+                Write-TextAtomic -Path (Join-Path $assetRoot $localAssetRelativePath) -Content $localXml
+            }
+
+            if (-not [string]::IsNullOrWhiteSpace($effectiveXml)) {
+                Write-TextAtomic -Path (Join-Path $assetRoot $effectiveAssetRelativePath) -Content $effectiveXml
+            }
+
+            $entry.CurrentValue = [PSCustomObject]@{
+                CommandAvailable               = $entry.CurrentValue.CommandAvailable
+                LocalCaptured                  = $entry.CurrentValue.LocalCaptured
+                EffectiveCaptured              = $entry.CurrentValue.EffectiveCaptured
+                LocalMatchesEffective          = $entry.CurrentValue.LocalMatchesEffective
+                CaptureIssues                  = @($entry.CurrentValue.CaptureIssues)
+                CollectionSummaries            = @($entry.CurrentValue.CollectionSummaries)
+                LocalSnapshotAssetRelativePath = $localAssetRelativePath
+                EffectiveSnapshotAssetRelativePath = $effectiveAssetRelativePath
+            }
+            continue
+        }
+
         if ([string]$entry.Type -eq 'ExploitProtectionPolicy' -and $null -ne $entry.CurrentValue) {
             $xml = Get-ExploitProtectionPolicyXml -State $entry.CurrentValue
             $assetRelativePath = Join-Path 'exploit-protection' 'policy.xml'
@@ -2892,6 +5251,7 @@ function Get-DefenseDefinitions {
     }
 
     @(
+        [PSCustomObject]@{ Id = 'defender.runtime_status'; Type = 'DefenderRuntimeStatus'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'defender.disable_realtime_monitoring'; Type = 'MpPreferenceValue'; Property = 'DisableRealtimeMonitoring'; PermissiveValue = $true; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'defender.disable_behavior_monitoring'; Type = 'MpPreferenceValue'; Property = 'DisableBehaviorMonitoring'; PermissiveValue = $true; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'defender.maps_reporting'; Type = 'MpPreferenceValue'; Property = 'MAPSReporting'; PermissiveValue = 'Disabled'; ValueMap = @{ '0' = 'Disabled'; '1' = 'Basic'; '2' = 'Advanced' }; RequiresReboot = $false }
@@ -2902,15 +5262,34 @@ function Get-DefenseDefinitions {
         [PSCustomObject]@{ Id = 'defender.disable_intrusion_prevention_system'; Type = 'MpPreferenceValue'; Property = 'DisableIntrusionPreventionSystem'; PermissiveValue = $true; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'defender.enable_network_protection'; Type = 'MpPreferenceValue'; Property = 'EnableNetworkProtection'; PermissiveValue = 'Disabled'; ValueMap = @{ '0' = 'Disabled'; '1' = 'Enabled'; '2' = 'AuditMode' }; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'defender.enable_controlled_folder_access'; Type = 'MpPreferenceValue'; Property = 'EnableControlledFolderAccess'; PermissiveValue = 'Disabled'; ValueMap = @{ '0' = 'Disabled'; '1' = 'Enabled'; '2' = 'AuditMode' }; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.exclusion_paths'; Type = 'MpPreferenceList'; Property = 'ExclusionPath'; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.exclusion_processes'; Type = 'MpPreferenceList'; Property = 'ExclusionProcess'; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.exclusion_extensions'; Type = 'MpPreferenceList'; Property = 'ExclusionExtension'; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.cfa_allowed_applications'; Type = 'MpPreferenceList'; Property = 'ControlledFolderAccessAllowedApplications'; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'defender.cfa_protected_folders'; Type = 'MpPreferenceList'; Property = 'ControlledFolderAccessProtectedFolders'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'defender.asr_rules'; Type = 'AsrRules'; RequiresReboot = $false }
 
-        [PSCustomObject]@{ Id = 'firewall.profiles'; Type = 'FirewallProfiles'; Profiles = @('Domain', 'Private', 'Public'); PermissiveValue = $false; RequiresReboot = $false }
+        [PSCustomObject]@{
+            Id                                     = 'firewall.profiles'
+            Type                                   = 'FirewallProfiles'
+            Profiles                               = @('Domain', 'Private', 'Public')
+            PermissiveValue                        = $false
+            PermissiveDefaultInboundAction         = 'Allow'
+            PermissiveDefaultOutboundAction        = 'Allow'
+            PermissiveAllowUnicastResponseToMulticast = $true
+            PermissiveNotifyOnListen               = $false
+            PermissiveLogAllowed                   = $false
+            PermissiveLogBlocked                   = $false
+            PermissiveLogIgnored                   = $false
+            RequiresReboot                         = $false
+        }
 
         [PSCustomObject]@{ Id = 'powershell.lockdown'; Type = 'MachineEnvironmentValue'; Name = '__PSLockdownPolicy'; PermissiveExists = $true; PermissiveValue = '0'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'powershell.script_block_logging'; Type = 'RegistryKeyFlat'; Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'powershell.module_logging'; Type = 'PowerShellModuleLogging'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'powershell.transcription'; Type = 'RegistryKeyFlat'; Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell\Transcription'; RequiresReboot = $false }
 
+        [PSCustomObject]@{ Id = 'applocker.policy'; Type = 'AppLockerPolicy'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'applocker.service'; Type = 'ServiceConfig'; Name = 'AppIDSvc'; PermissiveStartup = 'demand'; PermissiveState = 'Stopped'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'print.spooler_service'; Type = 'ServiceConfig'; Name = 'Spooler'; PermissiveStartup = 'auto'; PermissiveState = 'Running'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'localuser.administrator'; Type = 'LocalUser'; Rid = 500; Name = 'Built-in local administrator'; PermissiveValue = $true; RequiresReboot = $false }
@@ -2919,7 +5298,11 @@ function Get-DefenseDefinitions {
         [PSCustomObject]@{ Id = 'uac.enable_lua'; Type = 'RegistryValue'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name = 'EnableLUA'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $true }
         [PSCustomObject]@{ Id = 'uac.consent_prompt_behavior_admin'; Type = 'RegistryValue'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\System'; Name = 'ConsentPromptBehaviorAdmin'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $true }
 
+        [PSCustomObject]@{ Id = 'rdp.allow_connections'; Type = 'RegistryValue'; Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'; Name = 'fDenyTSConnections'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'rdp.user_authentication'; Type = 'RegistryValue'; Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Name = 'UserAuthentication'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'rdp.security_layer'; Type = 'RegistryValue'; Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Name = 'SecurityLayer'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'rdp.listener_enabled'; Type = 'RegistryValue'; Path = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp'; Name = 'fEnableWinStation'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 1; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'rdp.firewall_rules'; Type = 'FirewallRules'; Group = '@FirewallAPI.dll,-28752'; PermissiveEnabled = $true; RequiresReboot = $false }
 
         [PSCustomObject]@{ Id = 'wsh.enabled'; Type = 'RegistryValue'; Path = 'HKLM:\SOFTWARE\Microsoft\Windows Script Host\Settings'; Name = 'Enabled'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 1; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'smartscreen.enable'; Type = 'RegistryValue'; Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name = 'EnableSmartScreen'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 0; RequiresReboot = $false }
@@ -2947,10 +5330,40 @@ function Get-DefenseDefinitions {
         [PSCustomObject]@{ Id = 'audit.process_creation'; Type = 'AuditPolicy'; Subcategory = 'Process Creation'; PermissiveSuccess = $false; PermissiveFailure = $false; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'print.register_spooler_remote_rpc_endpoint'; Type = 'RegistryValue'; Path = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers'; Name = 'RegisterSpoolerRemoteRpcEndPoint'; ValueKind = 'DWord'; PermissiveExists = $true; PermissiveValue = 1; RequiresReboot = $false }
 
+        [PSCustomObject]@{ Id = 'winrm.service'; Type = 'ServiceConfig'; Name = 'WinRM'; PermissiveStartup = 'auto'; PermissiveState = 'Running'; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'winrm.service.allow_unencrypted'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Service\AllowUnencrypted'; PermissiveValue = $true; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'winrm.client.allow_unencrypted'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Client\AllowUnencrypted'; PermissiveValue = $true; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'winrm.service.basic'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Service\Auth\Basic'; PermissiveValue = $true; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'winrm.client.basic'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Client\Auth\Basic'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.client.digest'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Client\Auth\Digest'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.service.certificate'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Service\Auth\Certificate'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.client.certificate'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Client\Auth\Certificate'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.service.kerberos'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Service\Auth\Kerberos'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.client.kerberos'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Client\Auth\Kerberos'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.service.negotiate'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Service\Auth\Negotiate'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.client.negotiate'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Client\Auth\Negotiate'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.service.credssp'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Service\Auth\CredSSP'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.client.credssp'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Client\Auth\CredSSP'; PermissiveValue = $true; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.service.cbt_hardening_level'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Service\CbtHardeningLevel'; PermissiveValue = 'Relaxed'; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.service.ipv4_filter'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Service\IPv4Filter'; PermissiveValue = '*'; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.service.ipv6_filter'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Service\IPv6Filter'; PermissiveValue = '*'; RequiresReboot = $false }
+        [PSCustomObject]@{ Id = 'winrm.client.trusted_hosts'; Type = 'WsManValue'; Path = 'WSMan:\localhost\Client\TrustedHosts'; PermissiveValue = '*'; RequiresReboot = $false }
+        [PSCustomObject]@{
+            Id             = 'winrm.listeners'
+            Type           = 'WinRmListeners'
+            PermissiveValue = @(
+                [PSCustomObject]@{
+                    Address               = '*'
+                    Transport             = 'HTTP'
+                    Port                  = 5985
+                    Hostname              = ''
+                    Enabled               = $true
+                    URLPrefix             = 'wsman'
+                    CertificateThumbprint = ''
+                }
+            )
+            RequiresReboot = $false
+        }
 
         [PSCustomObject]@{ Id = 'smb.client.require_security_signature'; Type = 'SmbClientConfig'; PermissiveValue = $false; RequiresReboot = $false }
         [PSCustomObject]@{ Id = 'smb.server.require_security_signature'; Type = 'SmbServerConfig'; PermissiveValue = $false; RequiresReboot = $false }
@@ -2999,6 +5412,28 @@ function Capture-Definition {
                 RequiresReboot = $Definition.RequiresReboot
             }
         }
+        'MpPreferenceList' {
+            $state = Get-MpPreferenceListState -Property $Definition.Property
+
+            return [PSCustomObject]@{
+                Id               = $Definition.Id
+                Type             = 'MpPreferenceList'
+                Property         = $Definition.Property
+                CurrentValue     = @($state.Items)
+                CommandAvailable = $state.CommandAvailable
+                Captured         = $state.Captured
+                CaptureError     = $state.Error
+                RequiresReboot   = $Definition.RequiresReboot
+            }
+        }
+        'DefenderRuntimeStatus' {
+            return [PSCustomObject]@{
+                Id             = $Definition.Id
+                Type           = 'DefenderRuntimeStatus'
+                CurrentValue   = Get-DefenderRuntimeStatus
+                RequiresReboot = $Definition.RequiresReboot
+            }
+        }
         'BitLockerVolumes' {
             return [PSCustomObject]@{
                 Id             = $Definition.Id
@@ -3036,19 +5471,27 @@ function Capture-Definition {
         'PowerShellModuleLogging' {
             return Capture-PowerShellModuleLoggingState
         }
-        'FirewallProfiles' {
-            $profiles = foreach ($profile in $Definition.Profiles) {
-                $fw = Get-NetFirewallProfile -Profile $profile -ErrorAction SilentlyContinue
-                [PSCustomObject]@{
-                    Profile = $profile
-                    Enabled = $fw.Enabled
-                }
+        'AppLockerPolicy' {
+            return [PSCustomObject]@{
+                Id             = $Definition.Id
+                Type           = 'AppLockerPolicy'
+                CurrentValue   = Get-AppLockerPolicyState
+                RequiresReboot = $Definition.RequiresReboot
             }
-
+        }
+        'FirewallProfiles' {
             return [PSCustomObject]@{
                 Id             = $Definition.Id
                 Type           = 'FirewallProfiles'
-                CurrentValue   = @($profiles)
+                CurrentValue   = Get-FirewallProfileStates -Profiles @($Definition.Profiles)
+                RequiresReboot = $Definition.RequiresReboot
+            }
+        }
+        'FirewallRules' {
+            return [PSCustomObject]@{
+                Id             = $Definition.Id
+                Type           = 'FirewallRules'
+                CurrentValue   = Get-FirewallRuleGroupState -Group ([string]$Definition.Group)
                 RequiresReboot = $Definition.RequiresReboot
             }
         }
@@ -3064,7 +5507,7 @@ function Capture-Definition {
             return [PSCustomObject]@{
                 Id             = $Definition.Id
                 Type           = 'LoadedUserRegistryValues'
-                CurrentValue   = @(Get-LoadedUserRegistryValueStates -Items @($Definition.Items))
+                CurrentValue   = Get-LoadedUserRegistryValueStates -Items @($Definition.Items)
                 RequiresReboot = $Definition.RequiresReboot
             }
         }
@@ -3105,11 +5548,27 @@ function Capture-Definition {
             }
         }
         'WsManValue' {
+            $state = Get-WsManConfigValueState -Path $Definition.Path
             return [PSCustomObject]@{
                 Id             = $Definition.Id
                 Type           = 'WsManValue'
                 Path           = $Definition.Path
-                CurrentValue   = Get-WsManConfigValue -Path $Definition.Path
+                CurrentValue   = $state.Value
+                CommandAvailable = $state.CommandAvailable
+                Captured       = $state.Captured
+                CaptureError   = $state.Error
+                RequiresReboot = $Definition.RequiresReboot
+            }
+        }
+        'WinRmListeners' {
+            $state = Get-WinRmListenerStates
+            return [PSCustomObject]@{
+                Id             = $Definition.Id
+                Type           = 'WinRmListeners'
+                CurrentValue   = @($state.Listeners)
+                CommandAvailable = $state.CommandAvailable
+                Captured       = $state.Captured
+                CaptureError   = $state.Error
                 RequiresReboot = $Definition.RequiresReboot
             }
         }
@@ -3162,6 +5621,13 @@ function Apply-PermissiveDefinition {
         'MpPreferenceValue' {
             Set-MpPreferencePropertyValue -Property $Definition.Property -Value $Definition.PermissiveValue
         }
+        'MpPreferenceList' {
+            if ($Definition.PSObject.Properties['PermissiveValue']) {
+                Set-MpPreferenceListValue -Property $Definition.Property -DesiredItems @($Definition.PermissiveValue)
+            }
+        }
+        'DefenderRuntimeStatus' {
+        }
         'BitLockerVolumes' {
             $bitLockerState = if ($null -ne $Entry) { $Entry.CurrentValue } else { $null }
             Set-Permissive-BitLockerVolumes -State $bitLockerState
@@ -3178,8 +5644,15 @@ function Apply-PermissiveDefinition {
         'PowerShellModuleLogging' {
             Set-Permissive-PowerShellModuleLogging
         }
+        'AppLockerPolicy' {
+            $appLockerState = if ($null -ne $Entry) { $Entry.CurrentValue } else { $null }
+            Set-Permissive-AppLockerPolicy -State $appLockerState
+        }
         'FirewallProfiles' {
-            Set-NetFirewallProfile -Profile $Definition.Profiles -Enabled (ConvertTo-FirewallProfileEnabledValue -Value $Definition.PermissiveValue)
+            Set-Permissive-FirewallProfiles -Definition $Definition
+        }
+        'FirewallRules' {
+            Set-Permissive-FirewallRules -Definition $Definition
         }
         'NetBiosAdapters' {
             Set-Permissive-NetBiosAdapters
@@ -3207,6 +5680,9 @@ function Apply-PermissiveDefinition {
         }
         'WsManValue' {
             Set-WsManConfigValue -Path $Definition.Path -Value $Definition.PermissiveValue
+        }
+        'WinRmListeners' {
+            Set-Permissive-WinRmListeners -Listeners @($Definition.PermissiveValue)
         }
         'AuditPolicy' {
             Set-AuditPolicyState -Subcategory $Definition.Subcategory -Success $Definition.PermissiveSuccess -Failure $Definition.PermissiveFailure
@@ -3250,6 +5726,11 @@ function Restore-SnapshotEntry {
         'MpPreferenceValue' {
             Set-MpPreferencePropertyValue -Property $Entry.Property -Value $Entry.RestoreValue
         }
+        'MpPreferenceList' {
+            Set-MpPreferenceListValue -Property $Entry.Property -DesiredItems @($Entry.CurrentValue)
+        }
+        'DefenderRuntimeStatus' {
+        }
         'BitLockerVolumes' {
             Restore-BitLockerVolumes -State $Entry.CurrentValue
         }
@@ -3268,16 +5749,21 @@ function Restore-SnapshotEntry {
         'PowerShellModuleLogging' {
             Restore-PowerShellModuleLogging -Entry $Entry
         }
+        'AppLockerPolicy' {
+            Restore-AppLockerPolicy -State $Entry.CurrentValue -SnapshotPath $SnapshotPath
+        }
         'FirewallProfiles' {
-            foreach ($profile in @($Entry.CurrentValue)) {
-                Set-NetFirewallProfile -Profile $profile.Profile -Enabled (ConvertTo-FirewallProfileEnabledValue -Value $profile.Enabled)
-            }
+            Restore-FirewallProfiles -State $Entry.CurrentValue
+        }
+        'FirewallRules' {
+            Restore-FirewallRules -State $Entry.CurrentValue
         }
         'NetBiosAdapters' {
             Restore-NetBiosAdapters -Adapters @($Entry.CurrentValue)
         }
         'LoadedUserRegistryValues' {
-            Restore-LoadedUserRegistryValues -Entries @($Entry.CurrentValue)
+            $state = Normalize-UserRegistryValueState -State $Entry.CurrentValue
+            Restore-LoadedUserRegistryValues -Entries @($state.Entries)
         }
         'MachineEnvironmentValue' {
             if ($Entry.Exists) {
@@ -3305,6 +5791,9 @@ function Restore-SnapshotEntry {
         }
         'WsManValue' {
             Set-WsManConfigValue -Path $Entry.Path -Value $Entry.CurrentValue
+        }
+        'WinRmListeners' {
+            Restore-WinRmListeners -Listeners @($Entry.CurrentValue)
         }
         'AuditPolicy' {
             Set-AuditPolicyState -Subcategory $Entry.Subcategory -Success ([bool]$Entry.CurrentValue.Success) -Failure ([bool]$Entry.CurrentValue.Failure)
@@ -3421,12 +5910,16 @@ function Restore-DefenseSnapshot {
     $verification = Test-DefenseSnapshot -Snapshot $snapshot -SnapshotPath $fullPath
     $verificationPath = Get-VerificationReportPath -Root $StateRoot -SnapshotPath $fullPath
     $verificationLines = Get-VerificationReportLines -Verification $verification -SnapshotPath $fullPath
+    $wdacVerificationPath = Get-WdacVerificationReportPath -VerificationPath $verificationPath
+    $wdacVerificationLines = Get-WdacVerificationReportLines -Verification $verification -SnapshotPath $fullPath
     Write-TextAtomic -Path $verificationPath -Content ($verificationLines -join [Environment]::NewLine)
+    Write-TextAtomic -Path $wdacVerificationPath -Content ($wdacVerificationLines -join [Environment]::NewLine)
 
     if ($verification.MismatchCount -gt 0) {
         $mismatchIds = @($verification.Results | Where-Object { -not $_.Matches -and -not $_.Skipped } | ForEach-Object { $_.Id })
         Write-Warning "Restore verification found $($verification.MismatchCount) mismatched setting(s)."
         Write-Warning "Verification report saved to: $verificationPath"
+        Write-Warning "WDAC verification report saved to: $wdacVerificationPath"
         Write-Warning ("Mismatched IDs: {0}" -f ($mismatchIds -join ', '))
         throw 'Restore verification failed. current-operation.json was left in place so you can retry the same snapshot.'
     }
@@ -3434,6 +5927,7 @@ function Restore-DefenseSnapshot {
     Clear-OperationState -Root $StateRoot
     Write-Host "Restore completed and verified from snapshot: $fullPath"
     Write-Host "Verification report saved to: $verificationPath"
+    Write-Host "WDAC verification report saved to: $wdacVerificationPath"
     if ($verification.SkippedCount -gt 0) {
         $skippedIds = @($verification.Results | Where-Object { $_.Skipped } | ForEach-Object { $_.Id })
         Write-Warning ("Verification skipped {0} setting(s) because the snapshot baseline was incomplete: {1}" -f $verification.SkippedCount, ($skippedIds -join ', '))
