@@ -4252,7 +4252,7 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Property' -Value $Entry.Property
             Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $commandAvailable
             Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($commandAvailable -and $captured) { 'Complete' } else { 'Partial / incomplete' })
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Item count' -Value $items.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Item count' -Value @($items).Count
             if ($Entry.PSObject.Properties['CaptureError'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.CaptureError)) {
                 Add-ReportKeyValueLine -Lines $Lines -Label 'Capture error' -Value $Entry.CaptureError
             }
@@ -4288,13 +4288,13 @@ function Add-SnapshotEntryReportLines {
             $baselineComplete = Test-BitLockerStateCapturedExactly -State $state
 
             Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $state.CommandAvailable
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Timed out mount point count' -Value $timedOutMountPoints.Count
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Capture issue count' -Value $captureIssues.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Timed out mount point count' -Value @($timedOutMountPoints).Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Capture issue count' -Value @($captureIssues).Count
             Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($baselineComplete) { 'Complete' } else { 'Partial / incomplete' })
             if (-not $baselineComplete) {
                 Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'BitLocker round-trip requires an exact mounted-volume baseline. Permissive, restore, and verification skip this setting if mount points time out or richer BitLocker fields cannot be captured exactly.'
             }
-            if ($timedOutMountPoints.Count -gt 0) {
+            if (@($timedOutMountPoints).Count -gt 0) {
                 foreach ($mountPoint in $timedOutMountPoints) {
                     $Lines.Add(('  - Timed out mount point: {0}' -f $mountPoint))
                 }
@@ -4303,7 +4303,7 @@ function Add-SnapshotEntryReportLines {
                 $issueMountPoint = if (-not [string]::IsNullOrWhiteSpace([string]$issue.MountPoint)) { [string]$issue.MountPoint } else { '<unknown>' }
                 $Lines.Add(('  - Capture issue | MountPoint={0} | {1}' -f $issueMountPoint, $issue.Message))
             }
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Captured volume count' -Value $capturedVolumes.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Captured volume count' -Value @($capturedVolumes).Count
             foreach ($volume in @($capturedVolumes | Sort-Object -Property MountPoint)) {
                 $mountPoint = if (-not [string]::IsNullOrWhiteSpace([string]$volume.MountPoint)) { [string]$volume.MountPoint } else { '<unknown>' }
                 $protectionMode = if (-not [string]::IsNullOrWhiteSpace([string]$volume.ProtectionMode)) { [string]$volume.ProtectionMode } else { '<unknown>' }
@@ -4343,11 +4343,11 @@ function Add-SnapshotEntryReportLines {
             $activePolicies = @($policyRows | Where-Object { $_.IsEnforced -eq $true })
             $onDiskOnlyPolicies = @($policyRows | Where-Object { $_.HasFileOnDisk -eq $true -and $_.IsEnforced -eq $false })
             $activeOnlyPolicies = @($policyRows | Where-Object { $_.HasFileOnDisk -eq $false -and $_.IsEnforced -eq $true })
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Platform-managed policy count' -Value $platformManagedPolicies.Count
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Active policy count' -Value $activePolicies.Count
-            Add-ReportKeyValueLine -Lines $Lines -Label 'On-disk only / pending reboot count' -Value $onDiskOnlyPolicies.Count
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Active-only policy count' -Value $activeOnlyPolicies.Count
-            if ($platformManagedPolicies.Count -gt 0 -or $onDiskOnlyPolicies.Count -gt 0) {
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Platform-managed policy count' -Value @($platformManagedPolicies).Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Active policy count' -Value @($activePolicies).Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'On-disk only / pending reboot count' -Value @($onDiskOnlyPolicies).Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Active-only policy count' -Value @($activeOnlyPolicies).Count
+            if (@($platformManagedPolicies).Count -gt 0 -or @($onDiskOnlyPolicies).Count -gt 0) {
                 Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'WDAC reporting distinguishes active enforcement from on-disk file presence. On-disk-only policies usually indicate pending-reboot state, and platform-managed policies can require file-based handling or a reboot before live WDAC state fully matches the snapshot.'
             }
             foreach ($policyRow in $policyRows) {
@@ -4402,8 +4402,8 @@ function Add-SnapshotEntryReportLines {
             Add-ReportKeyValueLine -Lines $Lines -Label 'Local policy captured' -Value $localCaptured
             Add-ReportKeyValueLine -Lines $Lines -Label 'Effective policy captured' -Value $effectiveCaptured
             Add-ReportKeyValueLine -Lines $Lines -Label 'Local matches effective' -Value $localMatchesEffective
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Collection count' -Value $collectionSummaries.Count
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Capture issue count' -Value $captureIssues.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Collection count' -Value @($collectionSummaries).Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Capture issue count' -Value @($captureIssues).Count
             Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($baselineComplete) { 'Complete' } else { 'Partial / incomplete' })
             if (-not $baselineComplete) {
                 Add-ReportKeyValueLine -Lines $Lines -Label 'Operator note' -Value 'AppLocker round-trip is only treated as exact when the local and effective AppLocker policies match. If Group Policy or another higher-precedence source changes the effective policy, permissive, restore, and verification skip this entry rather than guessing.'
@@ -4517,7 +4517,7 @@ function Add-SnapshotEntryReportLines {
             $captured = if ($Entry.PSObject.Properties['Captured']) { [bool]$Entry.Captured } else { $true }
             $listeners = @($Entry.CurrentValue)
             Add-ReportKeyValueLine -Lines $Lines -Label 'Command available' -Value $commandAvailable
-            Add-ReportKeyValueLine -Lines $Lines -Label 'Listener count' -Value $listeners.Count
+            Add-ReportKeyValueLine -Lines $Lines -Label 'Listener count' -Value @($listeners).Count
             Add-ReportKeyValueLine -Lines $Lines -Label 'Baseline completeness' -Value $(if ($commandAvailable -and $captured) { 'Complete' } else { 'Partial / incomplete' })
             if ($Entry.PSObject.Properties['CaptureError'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.CaptureError)) {
                 Add-ReportKeyValueLine -Lines $Lines -Label 'Capture error' -Value $Entry.CaptureError
@@ -5834,16 +5834,16 @@ function Export-DefenseSnapshot {
         Settings      = @($settings)
     }
 
-    Write-Verbose "[post/4] Persisting snapshot sidecar assets"
+    Write-Verbose "[post 1/4] Persisting snapshot sidecar assets"
     Persist-SnapshotExternalAssets -Snapshot $snapshot -SnapshotPath $fullPath
 
-    Write-Verbose "[post/4] Building snapshot report"
+    Write-Verbose "[post 2/4] Building snapshot report"
     $reportPath = Get-SnapshotReportPath -SnapshotPath $fullPath
     $reportLines = Get-SnapshotReportLines -Snapshot $snapshot -SnapshotPath $fullPath
 
-    Write-Verbose "[post/4] Writing snapshot JSON"
+    Write-Verbose "[post 3/4] Writing snapshot JSON"
     Write-SnapshotJsonAtomic -Path $fullPath -Snapshot $snapshot
-    Write-Verbose "[post/4] Writing snapshot report"
+    Write-Verbose "[post 4/4] Writing snapshot report"
     Write-TextAtomic -Path $reportPath -Content ($reportLines -join [Environment]::NewLine)
 
     [PSCustomObject]@{
