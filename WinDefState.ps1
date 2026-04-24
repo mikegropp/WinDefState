@@ -6,7 +6,11 @@ param(
 
     [string]$SnapshotPath,
 
-    [string]$StateRoot
+    [string]$StateRoot,
+
+    [string[]]$IncludeId,
+
+    [string[]]$ExcludeId
 )
 
 Set-StrictMode -Version Latest
@@ -189,6 +193,52 @@ function Test-CommandAvailable {
     param([Parameter(Mandatory)] [string]$Name)
 
     $null -ne (Get-Command -Name $Name -ErrorAction SilentlyContinue | Select-Object -First 1)
+}
+
+function Get-NormalizedIdFilter {
+    param([AllowNull()] [string[]]$Ids)
+
+    @(
+        foreach ($rawId in @($Ids)) {
+            foreach ($id in @(([string]$rawId) -split ',')) {
+                if ([string]::IsNullOrWhiteSpace($id)) {
+                    continue
+                }
+
+                ([string]$id).Trim()
+            }
+        }
+    ) | Sort-Object -Unique
+}
+
+function Test-SettingIdIncluded {
+    param(
+        [Parameter(Mandatory)] [string]$Id,
+        [AllowNull()] [string[]]$IncludeId,
+        [AllowNull()] [string[]]$ExcludeId
+    )
+
+    $includedIds = @(Get-NormalizedIdFilter -Ids $IncludeId)
+    $excludedIds = @(Get-NormalizedIdFilter -Ids $ExcludeId)
+
+    if ($includedIds.Count -gt 0 -and $Id -notin $includedIds) {
+        return $false
+    }
+
+    if ($excludedIds.Count -gt 0 -and $Id -in $excludedIds) {
+        return $false
+    }
+
+    $true
+}
+
+function Test-IdFilterActive {
+    param(
+        [AllowNull()] [string[]]$IncludeId,
+        [AllowNull()] [string[]]$ExcludeId
+    )
+
+    (@(Get-NormalizedIdFilter -Ids $IncludeId).Count -gt 0 -or @(Get-NormalizedIdFilter -Ids $ExcludeId).Count -gt 0)
 }
 
 function Get-CiToolCommand {
@@ -4985,7 +5035,9 @@ function Test-SnapshotEntryCapturedExactly {
 function Test-DefenseSnapshot {
     param(
         [Parameter(Mandatory)] [object]$Snapshot,
-        [string]$SnapshotPath
+        [string]$SnapshotPath,
+        [AllowNull()] [string[]]$IncludeId,
+        [AllowNull()] [string[]]$ExcludeId
     )
 
     $definitions = @{}
@@ -4996,6 +5048,10 @@ function Test-DefenseSnapshot {
     $results = @()
     foreach ($entry in @($Snapshot.Settings)) {
         $entryId = [string]$entry.Id
+        if (-not (Test-SettingIdIncluded -Id $entryId -IncludeId $IncludeId -ExcludeId $ExcludeId)) {
+            continue
+        }
+
         $expectedComparable = ConvertTo-ComparableSnapshotEntry -Entry $entry -SnapshotPath $SnapshotPath
 
         if (-not (Test-SnapshotEntryCapturedExactly -Entry $entry -SnapshotPath $SnapshotPath)) {
@@ -5855,7 +5911,11 @@ function Export-DefenseSnapshot {
 }
 
 function Set-DefensePermissive {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [AllowNull()] [string[]]$IncludeId,
+        [AllowNull()] [string[]]$ExcludeId
+    )
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
         $Path = Get-DefaultSnapshotPath -Root $StateRoot
@@ -5864,7 +5924,7 @@ function Set-DefensePermissive {
     $export = Export-DefenseSnapshot -Path $Path
     Write-OperationState -Root $StateRoot -SnapshotPath $export.JsonPath -Mode 'Permissive'
 
-    $definitions = @(Get-DefenseDefinitions)
+    $definitions = @(Get-DefenseDefinitions | Where-Object { Test-SettingIdIncluded -Id ([string]$_.Id) -IncludeId $IncludeId -ExcludeId $ExcludeId })
     $snapshotEntriesById = @{}
     foreach ($entry in @($export.Snapshot.Settings)) {
         $snapshotEntriesById[[string]$entry.Id] = $entry
@@ -5882,12 +5942,16 @@ function Set-DefensePermissive {
         Apply-PermissiveDefinition -Definition $definition -Entry $entry
     }
 
-    Write-Host "Permissive mode applied. Snapshot JSON saved to: $($export.JsonPath)"
+    Write-Host "Permissive mode applied to $($definitions.Count) setting(s). Snapshot JSON saved to: $($export.JsonPath)"
     Write-Host "Snapshot report saved to: $($export.ReportPath)"
 }
 
 function Restore-DefenseSnapshot {
-    param([string]$Path)
+    param(
+        [string]$Path,
+        [AllowNull()] [string[]]$IncludeId,
+        [AllowNull()] [string[]]$ExcludeId
+    )
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
         $operation = Get-OperationState -Root $StateRoot
@@ -5900,14 +5964,21 @@ function Restore-DefenseSnapshot {
 
     $fullPath = [IO.Path]::GetFullPath($Path)
     $snapshot = Read-JsonFile -Path $fullPath
-    $entries = @($snapshot.Settings)
+    $allEntries = @($snapshot.Settings)
+    $entries = @($allEntries | Where-Object { Test-SettingIdIncluded -Id ([string]$_.Id) -IncludeId $IncludeId -ExcludeId $ExcludeId })
+    $isFilteredRestore = Test-IdFilterActive -IncludeId $IncludeId -ExcludeId $ExcludeId
+    $includedIds = @(Get-NormalizedIdFilter -Ids $IncludeId)
+    $excludedIds = @(Get-NormalizedIdFilter -Ids $ExcludeId)
+    if ($includedIds.Count -eq $allEntries.Count -and $excludedIds.Count -eq 0 -and $entries.Count -eq $allEntries.Count) {
+        $isFilteredRestore = $false
+    }
     for ($i = 0; $i -lt $entries.Count; $i++) {
         $entry = $entries[$i]
         Write-Verbose ("[{0}/{1}] Restoring {2}" -f ($i + 1), $entries.Count, $entry.Id)
         Restore-SnapshotEntry -Entry $entry -SnapshotPath $fullPath
     }
 
-    $verification = Test-DefenseSnapshot -Snapshot $snapshot -SnapshotPath $fullPath
+    $verification = Test-DefenseSnapshot -Snapshot $snapshot -SnapshotPath $fullPath -IncludeId $IncludeId -ExcludeId $ExcludeId
     $verificationPath = Get-VerificationReportPath -Root $StateRoot -SnapshotPath $fullPath
     $verificationLines = Get-VerificationReportLines -Verification $verification -SnapshotPath $fullPath
     $wdacVerificationPath = Get-WdacVerificationReportPath -VerificationPath $verificationPath
@@ -5924,7 +5995,11 @@ function Restore-DefenseSnapshot {
         throw 'Restore verification failed. current-operation.json was left in place so you can retry the same snapshot.'
     }
 
-    Clear-OperationState -Root $StateRoot
+    if ($isFilteredRestore) {
+        Write-Warning 'Filtered restore completed. current-operation.json was left in place because only selected settings were restored.'
+    } else {
+        Clear-OperationState -Root $StateRoot
+    }
     Write-Host "Restore completed and verified from snapshot: $fullPath"
     Write-Host "Verification report saved to: $verificationPath"
     Write-Host "WDAC verification report saved to: $wdacVerificationPath"
@@ -5950,9 +6025,9 @@ switch ($Command) {
         Show-ReportLines -Lines $export.ReportLines
     }
     'Permissive' {
-        Set-DefensePermissive -Path $SnapshotPath
+        Set-DefensePermissive -Path $SnapshotPath -IncludeId $IncludeId -ExcludeId $ExcludeId
     }
     'Restore' {
-        Restore-DefenseSnapshot -Path $SnapshotPath
+        Restore-DefenseSnapshot -Path $SnapshotPath -IncludeId $IncludeId -ExcludeId $ExcludeId
     }
 }

@@ -77,12 +77,25 @@ Run from an elevated PowerShell session.
 .\WinDefState.ps1 -Command Restore
 ```
 
+To launch the native PowerShell/WPF GUI:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Sta -File .\WinDefState.Gui.ps1
+```
+
 `Snapshot` prints the human-readable report to the console and saves the same report to disk next to the JSON snapshot.
 
 You can also restore from a specific snapshot file:
 
 ```powershell
 .\WinDefState.ps1 -Command Restore -SnapshotPath .\state\snapshots\HOST-20260420-120000.json
+```
+
+You can target specific setting IDs from the CLI, which is also how the GUI applies selected rows:
+
+```powershell
+.\WinDefState.ps1 -Command Permissive -IncludeId defender.enable_network_protection,rdp.user_authentication
+.\WinDefState.ps1 -Command Restore -SnapshotPath .\state\snapshots\HOST-20260420-120000.json -IncludeId rdp.user_authentication
 ```
 
 ## Important caveats
