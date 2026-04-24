@@ -67,23 +67,26 @@ WinDefState is a PowerShell tool for Windows defense testing. It snapshots the c
 - Restore verification reports: `.\state\verification\HOST-YYYYMMDD-HHMMSS-restore-check-YYYYMMDD-HHMMSS.txt`
 - WDAC-focused restore verification reports: `.\state\verification\HOST-YYYYMMDD-HHMMSS-restore-check-YYYYMMDD-HHMMSS-wdac.txt`
 
-## Usage
+## Three-command workflow
 
-Run from an elevated PowerShell session.
+The recommended path is one script and three elevated PowerShell calls:
 
 ```powershell
+# Snapshot only: capture current state and write the JSON/report files.
 .\WinDefState.ps1 -Command Snapshot
+
+# Snapshot first, then apply the supported permissive test posture.
 .\WinDefState.ps1 -Command Permissive
+
+# Restore and verify from current-operation.json.
 .\WinDefState.ps1 -Command Restore
 ```
 
-To launch the native PowerShell/WPF GUI:
-
-```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Sta -File .\WinDefState.Gui.ps1
-```
-
 `Snapshot` prints the human-readable report to the console and saves the same report to disk next to the JSON snapshot.
+
+`Permissive` always writes a fresh snapshot before changing settings. That snapshot is recorded in `.\state\current-operation.json`, so the plain `Restore` command knows which baseline to use.
+
+`Restore` reads the saved snapshot, restores every fully captured setting, verifies live state, and clears `current-operation.json` only after verification succeeds.
 
 You can also restore from a specific snapshot file:
 
@@ -91,11 +94,19 @@ You can also restore from a specific snapshot file:
 .\WinDefState.ps1 -Command Restore -SnapshotPath .\state\snapshots\HOST-20260420-120000.json
 ```
 
+## Optional selected-item mode
+
 You can target specific setting IDs from the CLI, which is also how the GUI applies selected rows:
 
 ```powershell
 .\WinDefState.ps1 -Command Permissive -IncludeId defender.enable_network_protection,rdp.user_authentication
 .\WinDefState.ps1 -Command Restore -SnapshotPath .\state\snapshots\HOST-20260420-120000.json -IncludeId rdp.user_authentication
+```
+
+The native PowerShell/WPF GUI is optional. It is useful when you want to inspect a snapshot and run selected IDs, but it is not required for the normal snapshot/permissive/restore workflow:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Sta -File .\WinDefState.Gui.ps1
 ```
 
 ## Important caveats

@@ -1,3 +1,37 @@
+<#
+.SYNOPSIS
+Snapshots, loosens, and restores supported Windows defense settings.
+
+.DESCRIPTION
+WinDefState is designed around three elevated PowerShell calls:
+
+1. Snapshot only: capture the current host state and write a report.
+2. Permissive: snapshot first, then apply supported permissive test settings.
+3. Restore: restore and verify from the saved operation journal, or from an explicit snapshot path.
+
+The GUI is optional. The safest and simplest workflow is this single script plus these three commands.
+
+.EXAMPLE
+.\WinDefState.ps1 -Command Snapshot
+
+Capture the current state only.
+
+.EXAMPLE
+.\WinDefState.ps1 -Command Permissive
+
+Capture the current state, write current-operation.json, then apply permissive settings.
+
+.EXAMPLE
+.\WinDefState.ps1 -Command Restore
+
+Restore from current-operation.json after a previous Permissive run.
+
+.EXAMPLE
+.\WinDefState.ps1 -Command Restore -SnapshotPath .\state\snapshots\HOST-20260420-120000.json
+
+Restore from a specific snapshot file instead of the current operation journal.
+#>
+
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)]
