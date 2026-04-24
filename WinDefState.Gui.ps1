@@ -98,6 +98,10 @@ function ConvertTo-ShortText {
 function Get-ItemCount {
     param([AllowNull()] [object]$Value)
 
+    if ($null -eq $Value) {
+        return 0
+    }
+
     $count = 0
     foreach ($item in @($Value)) {
         $count++
