@@ -219,7 +219,7 @@ function New-SnapshotRow {
         Category      = Get-EntryCategory -Entry $Entry
         Id            = [string]$Entry.Id
         Type          = [string]$Entry.Type
-        RequiresReboot = [bool]$Entry.RequiresReboot
+        Reboot        = if ($Entry.RequiresReboot) { 'Yes' } else { 'No' }
         Badges        = Get-EntryBadges -Entry $Entry
         Current       = Get-EntryCurrentSummary -Entry $Entry
         Action        = 'Permissive target'
@@ -373,11 +373,11 @@ $xaml = @'
               SelectionMode="Extended" Background="White" AlternatingRowBackground="#F8FAFC"
               RowHeaderWidth="0">
       <DataGrid.Columns>
-        <DataGridCheckBoxColumn Header="" Width="42" Binding="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
+        <DataGridCheckBoxColumn Header="Use" Width="42" Binding="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"/>
         <DataGridTextColumn Header="Category" Width="110" IsReadOnly="True" Binding="{Binding Category}"/>
         <DataGridTextColumn Header="Id" Width="260" IsReadOnly="True" Binding="{Binding Id}"/>
         <DataGridTextColumn Header="Type" Width="175" IsReadOnly="True" Binding="{Binding Type}"/>
-        <DataGridCheckBoxColumn Header="Reboot" Width="72" IsReadOnly="True" Binding="{Binding RequiresReboot}"/>
+        <DataGridTextColumn Header="Reboot" Width="72" IsReadOnly="True" Binding="{Binding Reboot}"/>
         <DataGridTextColumn Header="Badges" Width="180" IsReadOnly="True" Binding="{Binding Badges}"/>
         <DataGridTextColumn Header="Current" Width="*" MinWidth="220" IsReadOnly="True" Binding="{Binding Current}"/>
         <DataGridTemplateColumn Header="Action" Width="150">
