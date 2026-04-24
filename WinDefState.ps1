@@ -3,7 +3,7 @@
 Snapshots, loosens, and restores supported Windows defense settings.
 
 .DESCRIPTION
-WinDefState is designed around three elevated PowerShell calls:
+WinDefState is designed around three elevated PowerShell calls. Use the call you need at that point in the workflow:
 
 1. Snapshot only: capture the current host state and write a report.
 2. Permissive: snapshot first, then apply supported permissive test settings.
@@ -11,23 +11,25 @@ WinDefState is designed around three elevated PowerShell calls:
 
 The GUI is optional. The safest and simplest workflow is this single script plus these three commands.
 
+Use powershell.exe with -ExecutionPolicy Bypass when running a freshly downloaded copy on hosts that block direct .ps1 execution.
+
 .EXAMPLE
-.\WinDefState.ps1 -Command Snapshot
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\WinDefState.ps1 -Command Snapshot -Verbose
 
 Capture the current state only.
 
 .EXAMPLE
-.\WinDefState.ps1 -Command Permissive
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\WinDefState.ps1 -Command Permissive -Verbose
 
 Capture the current state, write current-operation.json, then apply permissive settings.
 
 .EXAMPLE
-.\WinDefState.ps1 -Command Restore
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\WinDefState.ps1 -Command Restore -Verbose
 
 Restore from current-operation.json after a previous Permissive run.
 
 .EXAMPLE
-.\WinDefState.ps1 -Command Restore -SnapshotPath .\state\snapshots\HOST-20260420-120000.json
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\WinDefState.ps1 -Command Restore -SnapshotPath .\state\snapshots\HOST-20260420-120000.json -Verbose
 
 Restore from a specific snapshot file instead of the current operation journal.
 #>
