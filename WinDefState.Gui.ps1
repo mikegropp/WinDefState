@@ -95,6 +95,17 @@ function ConvertTo-ShortText {
     $text
 }
 
+function Get-ItemCount {
+    param([AllowNull()] [object]$Value)
+
+    $count = 0
+    foreach ($item in @($Value)) {
+        $count++
+    }
+
+    $count
+}
+
 function Get-EntryCategory {
     param([Parameter(Mandatory)] [object]$Entry)
 
@@ -122,25 +133,25 @@ function Get-EntryCurrentSummary {
             return (ConvertTo-ShortText -Value $Entry.CurrentValue)
         }
         'MpPreferenceList' {
-            return ('{0} item(s)' -f @($Entry.CurrentValue).Count)
+            return ('{0} item(s)' -f (Get-ItemCount -Value $Entry.CurrentValue))
         }
         'ServiceConfig' {
             return ('{0} / {1}' -f $Entry.CurrentValue.StartMode, $Entry.CurrentValue.State)
         }
         'FirewallProfiles' {
-            return ('{0} profile(s)' -f @($Entry.CurrentValue.Profiles).Count)
+            return ('{0} profile(s)' -f (Get-ItemCount -Value $Entry.CurrentValue.Profiles))
         }
         'FirewallRules' {
-            return ('{0} rule(s)' -f @($Entry.CurrentValue.Rules).Count)
+            return ('{0} rule(s)' -f (Get-ItemCount -Value $Entry.CurrentValue.Rules))
         }
         'LoadedUserRegistryValues' {
-            return ('{0} value(s), {1} issue(s)' -f @($Entry.CurrentValue.Entries).Count, @($Entry.CurrentValue.CaptureIssues).Count)
+            return ('{0} value(s), {1} issue(s)' -f (Get-ItemCount -Value $Entry.CurrentValue.Entries), (Get-ItemCount -Value $Entry.CurrentValue.CaptureIssues))
         }
         'WdacPolicies' {
-            return ('{0} policy item(s), {1} file(s)' -f @($Entry.CurrentValue.Policies).Count, @($Entry.CurrentValue.Files).Count)
+            return ('{0} policy item(s), {1} file(s)' -f (Get-ItemCount -Value $Entry.CurrentValue.Policies), (Get-ItemCount -Value $Entry.CurrentValue.Files))
         }
         'BitLockerVolumes' {
-            return ('{0} volume(s)' -f @($Entry.CurrentValue.Volumes).Count)
+            return ('{0} volume(s)' -f (Get-ItemCount -Value $Entry.CurrentValue.Volumes))
         }
         default {
             return (ConvertTo-ShortText -Value $Entry.CurrentValue)
@@ -156,7 +167,7 @@ function Get-EntryBadges {
         $badges.Add('Requires reboot')
     }
 
-    if ($Entry.PSObject.Properties['InvalidEntries'] -and @($Entry.InvalidEntries).Count -gt 0) {
+    if ($Entry.PSObject.Properties['InvalidEntries'] -and (Get-ItemCount -Value $Entry.InvalidEntries) -gt 0) {
         $badges.Add('Partial')
     }
 
@@ -170,13 +181,13 @@ function Get-EntryBadges {
 
     if ($Entry.PSObject.Properties['CurrentValue'] -and $null -ne $Entry.CurrentValue) {
         $state = $Entry.CurrentValue
-        if ($state.PSObject.Properties['CaptureIssues'] -and @($state.CaptureIssues).Count -gt 0) {
+        if ($state.PSObject.Properties['CaptureIssues'] -and (Get-ItemCount -Value $state.CaptureIssues) -gt 0) {
             $badges.Add('Partial')
         }
         if ($state.PSObject.Properties['LocalMatchesEffective'] -and -not [bool]$state.LocalMatchesEffective) {
             $badges.Add('Partial')
         }
-        if ($state.PSObject.Properties['TimedOutMountPoints'] -and @($state.TimedOutMountPoints).Count -gt 0) {
+        if ($state.PSObject.Properties['TimedOutMountPoints'] -and (Get-ItemCount -Value $state.TimedOutMountPoints) -gt 0) {
             $badges.Add('Partial')
         }
         if ($state.PSObject.Properties['Policies']) {
@@ -260,7 +271,7 @@ function Load-Snapshot {
 
     $script:SnapshotPath = $fullPath
     $SnapshotPathText.Text = $fullPath
-    Set-GuiStatus ("Loaded {0} setting(s) from {1}" -f $script:Rows.Count, [IO.Path]::GetFileName($fullPath))
+    Set-GuiStatus ("Loaded {0} setting(s) from {1}" -f (Get-ItemCount -Value $script:Rows), [IO.Path]::GetFileName($fullPath))
 }
 
 function Get-SelectedRows {
@@ -290,7 +301,7 @@ function Invoke-WinDefState {
         $arguments += @('-SnapshotPath', $SnapshotPath)
     }
 
-    if (@($IncludeId).Count -gt 0) {
+    if ((Get-ItemCount -Value $IncludeId) -gt 0) {
         $arguments += '-IncludeId'
         $arguments += @($IncludeId)
     }
@@ -444,7 +455,7 @@ $SelectAllButton.Add_Click({
         $row.Selected = $true
     }
     $SettingsGrid.Items.Refresh()
-    Set-GuiStatus ("Selected {0} setting(s)." -f $script:Rows.Count)
+    Set-GuiStatus ("Selected {0} setting(s)." -f (Get-ItemCount -Value $script:Rows))
 })
 
 $ClearButton.Add_Click({
@@ -458,12 +469,12 @@ $ClearButton.Add_Click({
 $RunSelectedButton.Add_Click({
     Invoke-GuiOperation -Name 'Running selected action...' -Operation {
         $selectedRows = @(Get-SelectedRows)
-        if ($selectedRows.Count -eq 0) {
+        if ((Get-ItemCount -Value $selectedRows) -eq 0) {
             throw 'Select at least one setting first.'
         }
 
         $actions = @($selectedRows | ForEach-Object { [string]$_.Action } | Sort-Object -Unique)
-        if ($actions.Count -ne 1) {
+        if ((Get-ItemCount -Value $actions) -ne 1) {
             throw 'Selected rows must use one action at a time.'
         }
 
