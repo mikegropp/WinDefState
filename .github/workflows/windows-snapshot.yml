@@ -1,0 +1,25 @@
+name: Windows Snapshot Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  snapshot:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Capture and validate read-only Windows snapshot
+        shell: powershell
+        run: .\tests\WindowsSnapshot.ps1 -OutputRoot (Join-Path $env:RUNNER_TEMP 'WinDefState-Integration')
+      - name: Upload snapshot metrics and reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-snapshot-integration
+          path: ${{ runner.temp }}\WinDefState-Integration
+          if-no-files-found: warn
+          retention-days: 7

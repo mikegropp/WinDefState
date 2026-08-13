@@ -1,0 +1,55 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  validate-build-release:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-PSRepository -Name PSGallery -InstallationPolicy Trusted
+          Install-Module -Name Pester -RequiredVersion 5.7.1 -Scope CurrentUser -Force -SkipPublisherCheck
+          Install-Module -Name PSScriptAnalyzer -RequiredVersion 1.24.0 -Scope CurrentUser -Force
+      - name: Validate Windows PowerShell 5.1 distribution
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          .\tests\Smoke.ps1
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -Sta -File .\WinDefState.Gui.ps1 -ValidateOnly
+          if ($LASTEXITCODE -ne 0) {
+            throw "WPF visual-tree validation failed with exit code $LASTEXITCODE."
+          }
+          .\tests\Analyze.ps1
+          Import-Module Pester -RequiredVersion 5.7.1
+          Invoke-Pester -Path .\tests -CI
+      - name: Build deterministic release assets
+        shell: powershell
+        run: .\build\Build-Release.ps1 -Version $env:GITHUB_REF_NAME -OutputPath .\dist
+      - name: Publish GitHub release
+        shell: powershell
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @(
+            '.\dist\WinDefState.ps1'
+            '.\dist\WinDefState.Gui.ps1'
+            ".\dist\WinDefState-$tag.zip"
+            ".\dist\WinDefState-$tag-SHA256SUMS.txt"
+          )
+          & gh release create $tag @assets --verify-tag --generate-notes --title "WinDefState $tag"
+          if ($LASTEXITCODE -ne 0) {
+            throw "gh release create failed with exit code $LASTEXITCODE."
+          }
