@@ -731,6 +731,269 @@ function Test-CommandAvailable {
     $null -ne (Get-WinDefStateCommand -Name $Name)
 }
 
+function New-WinDefStatePreflightCheck {
+    param(
+        [Parameter(Mandatory)] [string]$Name,
+        [Parameter(Mandatory)] [ValidateSet('Pass', 'Warning', 'Info')] [string]$Status,
+        [Parameter(Mandatory)] [string]$Value,
+        [string]$Detail
+    )
+
+    [PSCustomObject]@{
+        Name   = $Name
+        Status = $Status
+        Value  = $Value
+        Detail = $Detail
+    }
+}
+
+function Get-WinDefStatePendingRebootState {
+    if ($env:OS -ne 'Windows_NT') {
+        return [PSCustomObject]@{
+            Supported = $false
+            Pending   = $false
+            Reasons   = @()
+        }
+    }
+
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending',
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired'
+    )) {
+        if (Test-Path -LiteralPath $path) {
+            $reasons.Add($path) | Out-Null
+        }
+    }
+
+    try {
+        $sessionManager = Get-ItemProperty -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name 'PendingFileRenameOperations' -ErrorAction Stop
+        if ($sessionManager.PSObject.Properties['PendingFileRenameOperations'] -and $null -ne $sessionManager.PendingFileRenameOperations) {
+            $reasons.Add('PendingFileRenameOperations') | Out-Null
+        }
+    } catch [System.Management.Automation.ItemNotFoundException] {
+        Write-Verbose 'PendingFileRenameOperations is not present.'
+    } catch [System.Management.Automation.PSArgumentException] {
+        Write-Verbose 'PendingFileRenameOperations is not present.'
+    }
+
+    [PSCustomObject]@{
+        Supported = $true
+        Pending   = $reasons.Count -gt 0
+        Reasons   = @($reasons)
+    }
+}
+
+function Get-WinDefStatePreflightProviderRequirements {
+    param(
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]]$Items,
+        [Parameter(Mandatory)] [ValidateSet('Snapshot', 'Permissive', 'Restore')] [string]$Action
+    )
+
+    $commandsByProviderType = @{
+        DefenderRuntimeStatus    = @('Get-MpComputerStatus')
+        MpPreferenceValue        = @('Get-MpPreference')
+        MpPreferenceList         = @('Get-MpPreference')
+        AsrRules                 = @('Get-MpPreference')
+        ServiceConfig            = @('Get-CimInstance')
+        LocalUser                = @('Get-CimInstance')
+        LoadedUserRegistryValues = @('Get-CimInstance', 'reg.exe')
+        NetBiosAdapters          = @('Get-CimInstance')
+        WsManValue               = @('Get-WSManInstance')
+        WinRmListeners           = @('Get-WSManInstance')
+        SmbClientConfig          = @('Get-SmbClientConfiguration', 'powershell.exe')
+        SmbServerConfig          = @('Get-SmbServerConfiguration', 'powershell.exe')
+        BitLockerVolumes         = @('Get-BitLockerVolume', 'powershell.exe')
+        AppLockerPolicy          = @('Get-AppLockerPolicy')
+        ExploitProtectionPolicy  = @('Get-ProcessMitigation')
+        FirewallProfiles         = @('Get-NetFirewallProfile')
+        FirewallRules            = @('Get-NetFirewallRule')
+    }
+    $mutationCommandsByProviderType = @{
+        MpPreferenceValue       = @('Set-MpPreference')
+        MpPreferenceList        = @('Add-MpPreference', 'Remove-MpPreference')
+        AsrRules                = @('Add-MpPreference', 'Remove-MpPreference')
+        ServiceConfig           = @('sc.exe')
+        WsManValue              = @('Set-WSManInstance')
+        WinRmListeners          = @('New-WSManInstance', 'Remove-WSManInstance')
+        SmbClientConfig         = @('Set-SmbClientConfiguration')
+        SmbServerConfig         = @('Set-SmbServerConfiguration')
+        BitLockerVolumes        = @('Suspend-BitLocker', 'Resume-BitLocker', 'manage-bde.exe')
+        AppLockerPolicy         = @('Set-AppLockerPolicy')
+        ExploitProtectionPolicy = @('Set-ProcessMitigation')
+        WdacPolicies             = @('CiTool.exe')
+        FirewallProfiles        = @('Set-NetFirewallProfile')
+        FirewallRules           = @('Set-NetFirewallRule')
+    }
+
+    $providersByCommand = @{}
+    foreach ($item in @($Items)) {
+        if ($null -eq $item -or -not $item.PSObject.Properties['Type']) {
+            continue
+        }
+        $providerType = [string]$item.Type
+        $commands = [System.Collections.Generic.List[string]]::new()
+        if ($commandsByProviderType.ContainsKey($providerType)) {
+            foreach ($commandName in @($commandsByProviderType[$providerType])) {
+                $commands.Add([string]$commandName) | Out-Null
+            }
+        }
+        $needsMutationCommands = if ($Action -eq 'Permissive') {
+            Test-DefinitionHasPermissiveAction -Definition $item
+        } elseif ($Action -eq 'Restore') {
+            Test-DefinitionHasRestoreAction -Definition $item
+        } else {
+            $false
+        }
+        if ($needsMutationCommands -and $mutationCommandsByProviderType.ContainsKey($providerType)) {
+            foreach ($commandName in @($mutationCommandsByProviderType[$providerType])) {
+                $commands.Add([string]$commandName) | Out-Null
+            }
+        }
+
+        foreach ($commandName in $commands) {
+            $commandKey = $commandName.ToLowerInvariant()
+            if (-not $providersByCommand.ContainsKey($commandKey)) {
+                $providersByCommand[$commandKey] = [PSCustomObject]@{
+                    Command   = $commandName
+                    Providers = [System.Collections.Generic.List[string]]::new()
+                }
+            }
+            if (-not $providersByCommand[$commandKey].Providers.Contains($providerType)) {
+                $providersByCommand[$commandKey].Providers.Add($providerType) | Out-Null
+            }
+        }
+    }
+
+    @(
+        foreach ($record in @($providersByCommand.Values | Sort-Object -Property Command)) {
+            [PSCustomObject]@{
+                Command   = [string]$record.Command
+                Providers = @($record.Providers | Sort-Object)
+            }
+        }
+    )
+}
+
+function Get-WinDefStatePreflight {
+    param(
+        [Parameter(Mandatory)] [ValidateSet('Snapshot', 'Permissive', 'Restore')] [string]$Action,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]]$Items,
+        [Parameter(Mandatory)] [string]$Root,
+        [string]$SnapshotPath
+    )
+
+    $checks = [System.Collections.Generic.List[object]]::new()
+    $languageMode = [string]$ExecutionContext.SessionState.LanguageMode
+    $languageStatus = if ([string]::Equals($languageMode, 'FullLanguage', [System.StringComparison]::OrdinalIgnoreCase)) { 'Pass' } else { 'Warning' }
+    $checks.Add((New-WinDefStatePreflightCheck -Name 'PowerShell language mode' -Status $languageStatus -Value $languageMode -Detail 'Restricted language modes can prevent provider and .NET operations.')) | Out-Null
+
+    $runtime = Get-WinDefStateRuntimeInfo
+    $runtimeValue = "PowerShell $($runtime.PowerShellVersion) $($runtime.PowerShellEdition), $($runtime.ProcessArchitecture)"
+    $checks.Add((New-WinDefStatePreflightCheck -Name 'Runtime' -Status Pass -Value $runtimeValue -Detail 'WinDefState targets Windows PowerShell 5.1 compatibility.')) | Out-Null
+
+    try {
+        $effectivePolicy = [string](Get-ExecutionPolicy -ErrorAction Stop)
+        $checks.Add((New-WinDefStatePreflightCheck -Name 'Effective execution policy' -Status Info -Value $effectivePolicy -Detail 'The current process has already loaded WinDefState; this value is diagnostic only.')) | Out-Null
+    } catch {
+        $checks.Add((New-WinDefStatePreflightCheck -Name 'Effective execution policy' -Status Warning -Value '<unavailable>' -Detail $_.Exception.Message)) | Out-Null
+    }
+
+    $pendingReboot = Get-WinDefStatePendingRebootState
+    if (-not $pendingReboot.Supported) {
+        $checks.Add((New-WinDefStatePreflightCheck -Name 'Pending reboot' -Status Info -Value 'Not evaluated' -Detail 'Pending-reboot detection is available only on Windows.')) | Out-Null
+    } elseif ($pendingReboot.Pending) {
+        $checks.Add((New-WinDefStatePreflightCheck -Name 'Pending reboot' -Status Warning -Value 'Yes' -Detail (@($pendingReboot.Reasons) -join '; '))) | Out-Null
+    } else {
+        $checks.Add((New-WinDefStatePreflightCheck -Name 'Pending reboot' -Status Pass -Value 'No' -Detail 'No common reboot-pending markers were found.')) | Out-Null
+    }
+
+    $rootPath = [IO.Path]::GetFullPath($Root)
+    $rootReady = Test-Path -LiteralPath $rootPath -PathType Container
+    $checks.Add((New-WinDefStatePreflightCheck -Name 'Protected state root' -Status $(if ($rootReady) { 'Pass' } else { 'Warning' }) -Value $rootPath -Detail $(if ($rootReady) { 'The operation state directory is available.' } else { 'The operation state directory is not available.' }))) | Out-Null
+
+    try {
+        $operation = Get-OperationState -Root $Root
+        if ($null -eq $operation) {
+            $journalStatus = if ($Action -eq 'Restore' -and [string]::IsNullOrWhiteSpace($SnapshotPath)) { 'Warning' } else { 'Pass' }
+            $journalDetail = if ($journalStatus -eq 'Warning') { 'Restore needs an active journal or an explicit snapshot path.' } else { 'No active operation journal exists.' }
+            $checks.Add((New-WinDefStatePreflightCheck -Name 'Operation journal' -Status $journalStatus -Value 'None' -Detail $journalDetail)) | Out-Null
+        } else {
+            $status = if ($operation.PSObject.Properties['Status']) { [string]$operation.Status } else { 'Legacy' }
+            $journalStatus = if ($Action -eq 'Permissive') { 'Warning' } else { 'Info' }
+            $checks.Add((New-WinDefStatePreflightCheck -Name 'Operation journal' -Status $journalStatus -Value $status -Detail ([string]$operation.SnapshotPath))) | Out-Null
+        }
+    } catch {
+        $checks.Add((New-WinDefStatePreflightCheck -Name 'Operation journal' -Status Warning -Value '<unreadable>' -Detail $_.Exception.Message)) | Out-Null
+    }
+
+    $checks.Add((New-WinDefStatePreflightCheck -Name 'Selected setting scope' -Status Info -Value ("{0} setting(s)" -f @($Items).Count) -Detail $Action)) | Out-Null
+    $requirements = @(Get-WinDefStatePreflightProviderRequirements -Items $Items -Action $Action)
+    foreach ($requirement in $requirements) {
+        $available = Test-CommandAvailable -Name ([string]$requirement.Command)
+        $checks.Add((New-WinDefStatePreflightCheck `
+            -Name ("Provider command: {0}" -f $requirement.Command) `
+            -Status $(if ($available) { 'Pass' } else { 'Warning' }) `
+            -Value $(if ($available) { 'Available' } else { 'Missing' }) `
+            -Detail (@($requirement.Providers) -join ', '))) | Out-Null
+    }
+
+    $warningChecks = @($checks | Where-Object { [string]$_.Status -eq 'Warning' })
+    [PSCustomObject]@{
+        Tool          = 'WinDefState'
+        Action        = $Action
+        ComputerName  = $env:COMPUTERNAME
+        CheckedAtUtc  = (Get-Date).ToUniversalTime().ToString('o')
+        OverallStatus = if ($warningChecks.Count -gt 0) { 'Warning' } else { 'Ready' }
+        WarningCount  = $warningChecks.Count
+        Checks        = @($checks)
+    }
+}
+
+function Get-WinDefStatePreflightReportLines {
+    param([Parameter(Mandatory)] [object]$Preflight)
+
+    $lines = [System.Collections.Generic.List[string]]::new()
+    $lines.Add('WinDefState preflight report') | Out-Null
+    $lines.Add(('Action: {0}' -f $Preflight.Action)) | Out-Null
+    $lines.Add(('Computer: {0}' -f $Preflight.ComputerName)) | Out-Null
+    $lines.Add(('Checked at UTC: {0}' -f $Preflight.CheckedAtUtc)) | Out-Null
+    $lines.Add(('Overall status: {0}' -f $Preflight.OverallStatus)) | Out-Null
+    $lines.Add(('Warnings: {0}' -f $Preflight.WarningCount)) | Out-Null
+    $lines.Add('') | Out-Null
+    foreach ($check in @($Preflight.Checks)) {
+        $lines.Add(('[{0}] {1}: {2}' -f ([string]$check.Status).ToUpperInvariant(), $check.Name, $check.Value)) | Out-Null
+        if (-not [string]::IsNullOrWhiteSpace([string]$check.Detail)) {
+            $lines.Add(('  {0}' -f $check.Detail)) | Out-Null
+        }
+    }
+    @($lines)
+}
+
+function Invoke-WinDefStatePreflight {
+    param(
+        [Parameter(Mandatory)] [ValidateSet('Snapshot', 'Permissive', 'Restore')] [string]$Action,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]]$Items,
+        [Parameter(Mandatory)] [string]$Root,
+        [string]$SnapshotPath
+    )
+
+    $preflight = Get-WinDefStatePreflight -Action $Action -Items $Items -Root $Root -SnapshotPath $SnapshotPath
+    $reportPath = Get-PreflightReportPath -Root $Root -Action $Action
+    $reportLines = Get-WinDefStatePreflightReportLines -Preflight $preflight
+    Write-TextAtomic -Path $reportPath -Content ($reportLines -join [Environment]::NewLine)
+    $preflight | Add-Member -NotePropertyName ReportPath -NotePropertyValue $reportPath -Force
+    Write-OperationResult -Name 'PreflightReport' -Value $reportPath
+
+    if ($preflight.WarningCount -gt 0) {
+        $warningNames = @($preflight.Checks | Where-Object { [string]$_.Status -eq 'Warning' } | ForEach-Object { [string]$_.Name })
+        Write-Warning ("Preflight found {0} warning(s): {1}. Report: {2}" -f $preflight.WarningCount, ($warningNames -join ', '), $reportPath)
+    } else {
+        Write-Host "Preflight ready. Report saved to: $reportPath"
+    }
+    $preflight
+}
+
 function New-CaptureSession {
     param([Parameter(Mandatory)] [ValidateSet('Snapshot', 'Permissive', 'Restore', 'Verification', 'PermissiveVerification')] [string]$Phase)
 
@@ -1503,6 +1766,18 @@ function Get-WdacVerificationReportPath {
     Join-Path $parent ($baseName + '-wdac.txt')
 }
 
+function Get-PreflightReportPath {
+    param(
+        [Parameter(Mandatory)] [string]$Root,
+        [Parameter(Mandatory)] [ValidateSet('Snapshot', 'Permissive', 'Restore')] [string]$Action
+    )
+
+    $preflightDir = Join-Path $Root 'preflight'
+    $computerName = if (-not [string]::IsNullOrWhiteSpace([string]$env:COMPUTERNAME)) { [string]$env:COMPUTERNAME } else { [Environment]::MachineName }
+    $baseName = "{0}-{1}-{2}" -f $computerName, (Get-Date -Format 'yyyyMMdd-HHmmss'), $Action.ToLowerInvariant()
+    Get-AvailableArtifactPath -Directory $preflightDir -BaseName $baseName -Extension '.txt'
+}
+
 function Get-OperationPath {
     param([Parameter(Mandatory)] [string]$Root)
 
@@ -1665,6 +1940,126 @@ function Update-OperationStateStatus {
         }
     }
 
+    Write-JsonAtomic -Path (Get-OperationPath -Root $Root) -InputObject $Operation
+    $Operation
+}
+
+function Get-NormalizedRestoreCheckpointIds {
+    param([AllowNull()] [object[]]$Id)
+
+    $result = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+    foreach ($candidate in @($Id)) {
+        $value = ([string]$candidate).Trim()
+        if (-not [string]::IsNullOrWhiteSpace($value) -and $seen.Add($value)) {
+            $result.Add($value) | Out-Null
+        }
+    }
+    @($result)
+}
+
+function Initialize-RestoreCheckpoint {
+    param(
+        [Parameter(Mandatory)] [string]$Root,
+        [Parameter(Mandatory)] [object]$Operation,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]]$RequestedIds
+    )
+
+    $existing = if ($Operation.PSObject.Properties['RestoreCheckpoint']) { $Operation.RestoreCheckpoint } else { $null }
+    $completedIds = if ($null -ne $existing -and $existing.PSObject.Properties['CompletedIds']) {
+        @(Get-NormalizedRestoreCheckpointIds -Id @($existing.CompletedIds))
+    } else {
+        @()
+    }
+    $attemptNumber = if ($null -ne $existing -and $existing.PSObject.Properties['AttemptNumber']) {
+        try { [int]$existing.AttemptNumber + 1 } catch { 1 }
+    } else {
+        1
+    }
+    $now = (Get-Date).ToUniversalTime().ToString('o')
+    $checkpoint = [PSCustomObject]@{
+        AttemptNumber        = $attemptNumber
+        AttemptId            = [guid]::NewGuid().ToString('D')
+        AttemptStartedAtUtc  = $now
+        UpdatedAtUtc         = $now
+        RequestedIds         = @(Get-NormalizedRestoreCheckpointIds -Id $RequestedIds)
+        CompletedIds         = @($completedIds)
+        VerifiedCompletedIds = @()
+        CurrentWorkItemId    = $null
+        CurrentIds           = @()
+        LastFailure          = $null
+    }
+
+    if ($Operation.PSObject.Properties['RestoreCheckpoint']) {
+        $Operation.RestoreCheckpoint = $checkpoint
+    } else {
+        $Operation | Add-Member -NotePropertyName RestoreCheckpoint -NotePropertyValue $checkpoint
+    }
+    Write-JsonAtomic -Path (Get-OperationPath -Root $Root) -InputObject $Operation
+    $Operation
+}
+
+function Set-RestoreCheckpointVerifiedIds {
+    param(
+        [Parameter(Mandatory)] [string]$Root,
+        [Parameter(Mandatory)] [object]$Operation,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]]$VerifiedIds
+    )
+
+    $Operation.RestoreCheckpoint.VerifiedCompletedIds = @(Get-NormalizedRestoreCheckpointIds -Id $VerifiedIds)
+    $Operation.RestoreCheckpoint.UpdatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    Write-JsonAtomic -Path (Get-OperationPath -Root $Root) -InputObject $Operation
+    $Operation
+}
+
+function Start-RestoreCheckpointWorkItem {
+    param(
+        [Parameter(Mandatory)] [string]$Root,
+        [Parameter(Mandatory)] [object]$Operation,
+        [Parameter(Mandatory)] [string]$WorkItemId,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]]$SettingIds
+    )
+
+    $Operation.RestoreCheckpoint.CurrentWorkItemId = $WorkItemId
+    $Operation.RestoreCheckpoint.CurrentIds = @(Get-NormalizedRestoreCheckpointIds -Id $SettingIds)
+    $Operation.RestoreCheckpoint.LastFailure = $null
+    $Operation.RestoreCheckpoint.UpdatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    Write-JsonAtomic -Path (Get-OperationPath -Root $Root) -InputObject $Operation
+    $Operation
+}
+
+function Complete-RestoreCheckpointWorkItem {
+    param(
+        [Parameter(Mandatory)] [string]$Root,
+        [Parameter(Mandatory)] [object]$Operation,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [string[]]$SettingIds
+    )
+
+    $Operation.RestoreCheckpoint.CompletedIds = @(
+        Get-NormalizedRestoreCheckpointIds -Id (@($Operation.RestoreCheckpoint.CompletedIds) + @($SettingIds))
+    )
+    $Operation.RestoreCheckpoint.CurrentWorkItemId = $null
+    $Operation.RestoreCheckpoint.CurrentIds = @()
+    $Operation.RestoreCheckpoint.UpdatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+    Write-JsonAtomic -Path (Get-OperationPath -Root $Root) -InputObject $Operation
+    $Operation
+}
+
+function Set-RestoreCheckpointFailure {
+    param(
+        [Parameter(Mandatory)] [string]$Root,
+        [Parameter(Mandatory)] [object]$Operation,
+        [Parameter(Mandatory)] [string]$Message
+    )
+
+    $safeMessage = if ($Message.Length -gt 2048) { $Message.Substring(0, 2048) } else { $Message }
+    $Operation.RestoreCheckpoint.LastFailure = [PSCustomObject]@{
+        FailedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
+        WorkItemId  = $Operation.RestoreCheckpoint.CurrentWorkItemId
+        SettingIds  = @($Operation.RestoreCheckpoint.CurrentIds)
+        Message     = $safeMessage
+    }
+    $Operation.RestoreCheckpoint.UpdatedAtUtc = (Get-Date).ToUniversalTime().ToString('o')
     Write-JsonAtomic -Path (Get-OperationPath -Root $Root) -InputObject $Operation
     $Operation
 }
@@ -7901,6 +8296,15 @@ function Get-VerificationReportLines {
     $lines.Add(('Incomplete-baseline settings: {0}' -f $incompleteCount))
     $lines.Add(('Inventory-only settings: {0}' -f $inventoryCount))
     $lines.Add(('Mismatched settings: {0}' -f $Verification.MismatchCount))
+    if ($Verification.PSObject.Properties['RestoreCheckpointSummary']) {
+        $checkpoint = $Verification.RestoreCheckpointSummary
+        $lines.Add(('Restore attempt: {0}' -f $checkpoint.AttemptNumber))
+        $lines.Add(('Restore mutation settings requested: {0}' -f $checkpoint.RequestedMutationCount))
+        $lines.Add(('Checkpointed settings revalidated: {0}' -f $checkpoint.PreviouslyCompletedCount))
+        $lines.Add(('Checkpointed settings skipped as matching: {0}' -f $checkpoint.RevalidatedAndSkippedCount))
+        $lines.Add(('Checkpointed settings scheduled again: {0}' -f $checkpoint.ReappliedCheckpointCount))
+        $lines.Add(('Restore mutation settings scheduled this attempt: {0}' -f $checkpoint.ScheduledMutationCount))
+    }
     if ($Verification.PSObject.Properties['CaptureMetrics']) {
         Add-CapturePerformanceReportLines -Lines $lines -Metrics $Verification.CaptureMetrics
     }
@@ -9900,12 +10304,14 @@ function Set-DefensePermissive {
         [AllowNull()] [string]$MutationApprovalPath
     )
 
-    Assert-NoActiveOperation -Root $StateRoot
     $definitions = @(Get-SelectedDefenseDefinitions -IncludeId $IncludeId -ExcludeId $ExcludeId)
     $mutationDefinitions = @($definitions | Where-Object { Test-DefinitionHasPermissiveAction -Definition $_ })
     if ($mutationDefinitions.Count -eq 0) {
         throw 'The selected settings are capture-only and have no permissive action.'
     }
+
+    $null = Invoke-WinDefStatePreflight -Action Permissive -Items $definitions -Root $StateRoot -SnapshotPath $Path
+    Assert-NoActiveOperation -Root $StateRoot
 
     if ([string]::IsNullOrWhiteSpace($Path)) {
         $Path = Get-DefaultSnapshotPath -Root $StateRoot
@@ -10047,6 +10453,60 @@ function Get-OrderedRestoreEntries {
     }
 }
 
+function Get-RestoreCheckpointResumeState {
+    param(
+        [Parameter(Mandatory)] [object]$Operation,
+        [Parameter(Mandatory)] [object]$Snapshot,
+        [Parameter(Mandatory)] [string]$SnapshotPath,
+        [Parameter(Mandatory)] [AllowEmptyCollection()] [object[]]$MutationEntries
+    )
+
+    $emptyResult = [PSCustomObject]@{
+        CandidateIds  = @()
+        VerifiedIds   = @()
+        RetryIds      = @()
+        Verification  = $null
+    }
+    if (
+        -not $Operation.PSObject.Properties['RestoreCheckpoint'] -or
+        $null -eq $Operation.RestoreCheckpoint -or
+        -not $Operation.RestoreCheckpoint.PSObject.Properties['CompletedIds']
+    ) {
+        return $emptyResult
+    }
+
+    $requestedIds = @(Get-NormalizedRestoreCheckpointIds -Id @($MutationEntries | ForEach-Object { [string]$_.Id }))
+    $requestedSet = @{}
+    foreach ($requestedId in $requestedIds) {
+        $requestedSet[([string]$requestedId).ToLowerInvariant()] = $true
+    }
+    $candidateIds = @(
+        Get-NormalizedRestoreCheckpointIds -Id @($Operation.RestoreCheckpoint.CompletedIds) |
+            Where-Object { $requestedSet.ContainsKey(([string]$_).ToLowerInvariant()) }
+    )
+    if ($candidateIds.Count -eq 0) {
+        return $emptyResult
+    }
+
+    $verification = Test-DefenseSnapshot -Snapshot $Snapshot -SnapshotPath $SnapshotPath -IncludeId $candidateIds
+    $verifiedIds = @(
+        $verification.Results |
+            Where-Object { $_.Matches -and -not $_.Skipped } |
+            ForEach-Object { [string]$_.Id }
+    )
+    $verifiedSet = @{}
+    foreach ($verifiedId in $verifiedIds) {
+        $verifiedSet[([string]$verifiedId).ToLowerInvariant()] = $true
+    }
+    $retryIds = @($candidateIds | Where-Object { -not $verifiedSet.ContainsKey(([string]$_).ToLowerInvariant()) })
+    [PSCustomObject]@{
+        CandidateIds = @($candidateIds)
+        VerifiedIds  = @($verifiedIds)
+        RetryIds     = @($retryIds)
+        Verification = $verification
+    }
+}
+
 function Restore-DefenseSnapshot {
     param(
         [string]$Path,
@@ -10060,6 +10520,7 @@ function Restore-DefenseSnapshot {
     $operation = Get-OperationState -Root $StateRoot
     if ([string]::IsNullOrWhiteSpace($Path)) {
         if ($null -eq $operation) {
+            $null = Invoke-WinDefStatePreflight -Action Restore -Items @() -Root $StateRoot
             throw "No active permissive operation was found. A successful restore clears current-operation.json. To restore a saved snapshot explicitly, rerun Restore with -SnapshotPath 'C:\path\to\snapshot.json'."
         }
 
@@ -10087,6 +10548,7 @@ function Restore-DefenseSnapshot {
     if ($includedIds.Count -eq $allEntries.Count -and $excludedIds.Count -eq 0 -and $entries.Count -eq $allEntries.Count) {
         $isFilteredRestore = $false
     }
+    $null = Invoke-WinDefStatePreflight -Action Restore -Items $entries -Root $StateRoot -SnapshotPath $fullPath
     Initialize-SnapshotAssetCache -Entries $entries -SnapshotPath $fullPath
     Write-OperationResult -Name 'SnapshotPath' -Value $fullPath
     Wait-MutationApproval -Path $MutationApprovalPath -Action Restore -SnapshotPath $fullPath -TrustedRoot $StateRoot -CancellationPath $CancellationPath
@@ -10095,6 +10557,38 @@ function Restore-DefenseSnapshot {
         $operation = Update-OperationStateStatus -Root $StateRoot -Operation $operation -Status 'Restoring'
     }
     $mutationEntries = @($entries | Where-Object { Test-DefinitionHasRestoreAction -Definition $_ })
+    $requestedMutationCount = $mutationEntries.Count
+    $restoreAttemptNumber = 0
+    $resumeState = [PSCustomObject]@{ CandidateIds = @(); VerifiedIds = @(); RetryIds = @(); Verification = $null }
+    $resumedSettingCount = 0
+    if ($operationTargetsSnapshot) {
+        $requestedMutationIds = @($mutationEntries | ForEach-Object { [string]$_.Id })
+        $operation = Initialize-RestoreCheckpoint -Root $StateRoot -Operation $operation -RequestedIds $requestedMutationIds
+        $restoreAttemptNumber = [int]$operation.RestoreCheckpoint.AttemptNumber
+        try {
+            $resumeState = Get-RestoreCheckpointResumeState -Operation $operation -Snapshot $snapshot -SnapshotPath $fullPath -MutationEntries $mutationEntries
+        } catch {
+            Write-Warning "Previously completed restore settings could not be revalidated and will be retried: $($_.Exception.Message)"
+            $resumeState = [PSCustomObject]@{ CandidateIds = @(); VerifiedIds = @(); RetryIds = @(); Verification = $null }
+        }
+        $operation = Set-RestoreCheckpointVerifiedIds -Root $StateRoot -Operation $operation -VerifiedIds @($resumeState.VerifiedIds)
+        $verifiedCheckpointSet = @{}
+        foreach ($verifiedId in @($resumeState.VerifiedIds)) {
+            $verifiedCheckpointSet[([string]$verifiedId).ToLowerInvariant()] = $true
+        }
+        $mutationEntries = @(
+            $mutationEntries | Where-Object {
+                -not $verifiedCheckpointSet.ContainsKey(([string]$_.Id).ToLowerInvariant())
+            }
+        )
+        $resumedSettingCount = @($resumeState.VerifiedIds).Count
+        if ($resumedSettingCount -gt 0) {
+            Write-Host ("Restore resume: {0} previously completed setting(s) still match the baseline and will not be reapplied." -f $resumedSettingCount)
+        }
+        if (@($resumeState.RetryIds).Count -gt 0) {
+            Write-Verbose ("Restore resume will reapply checkpointed setting(s) that no longer match: {0}" -f (@($resumeState.RetryIds) -join ', '))
+        }
+    }
     $restoreSession = New-CaptureSession -Phase Restore
     $restoreSession.UserRegistryDefinitionsRemaining = @($mutationEntries | Where-Object { [string]$_.Type -eq 'LoadedUserRegistryValues' }).Count
     $restoreSession.WinRmMutationDefinitionsRemaining = @($mutationEntries | Where-Object { [string]$_.Type -in @('WsManValue', 'WinRmListeners') }).Count
@@ -10120,8 +10614,12 @@ function Restore-DefenseSnapshot {
         $processedSettingCount = 0
         foreach ($workItem in $workItems) {
             $itemCount = @($workItem.Items).Count
+            $workItemSettingIds = @($workItem.Items | ForEach-Object { [string]$_.Id })
             $progressId = if ($itemCount -gt 1) { "$($workItem.Id) ($itemCount settings)" } else { [string]$workItem.Id }
             Write-OperationProgress -Phase 'Restore' -Current ($processedSettingCount + $itemCount) -Total $mutationEntries.Count -Id $progressId
+            if ($operationTargetsSnapshot) {
+                $operation = Start-RestoreCheckpointWorkItem -Root $StateRoot -Operation $operation -WorkItemId ([string]$workItem.Id) -SettingIds $workItemSettingIds
+            }
             try {
                 Invoke-TimedSettingOperation -Phase Restore -Id ([string]$workItem.Id) -Type ([string]$workItem.Type) -Session $restoreSession -Action {
                     Invoke-RestoreMutationWorkItem -WorkItem $workItem -SnapshotPath $fullPath -CaptureSession $restoreSession
@@ -10129,11 +10627,19 @@ function Restore-DefenseSnapshot {
             } finally {
                 Complete-MutationWorkItem -CaptureSession $restoreSession -WorkItem $workItem
             }
+            if ($operationTargetsSnapshot) {
+                $operation = Complete-RestoreCheckpointWorkItem -Root $StateRoot -Operation $operation -SettingIds $workItemSettingIds
+            }
             $processedSettingCount += $itemCount
         }
     } catch {
         $restoreError = $_
         if ($operationTargetsSnapshot) {
+            try {
+                $operation = Set-RestoreCheckpointFailure -Root $StateRoot -Operation $operation -Message $restoreError.Exception.Message
+            } catch {
+                Write-Warning "Restore failed and its per-setting checkpoint could not be updated: $($_.Exception.Message)"
+            }
             try {
                 $operation = Update-OperationStateStatus -Root $StateRoot -Operation $operation -Status 'RestoreFailed'
             } catch {
@@ -10152,6 +10658,16 @@ function Restore-DefenseSnapshot {
     try {
         $verification = Test-DefenseSnapshot -Snapshot $snapshot -SnapshotPath $fullPath -IncludeId $IncludeId -ExcludeId $ExcludeId
         $verification | Add-Member -NotePropertyName MutationMetrics -NotePropertyValue $restoreMetrics -Force
+        if ($operationTargetsSnapshot) {
+            $verification | Add-Member -NotePropertyName RestoreCheckpointSummary -NotePropertyValue ([PSCustomObject]@{
+                AttemptNumber               = $restoreAttemptNumber
+                RequestedMutationCount      = $requestedMutationCount
+                PreviouslyCompletedCount    = @($resumeState.CandidateIds).Count
+                RevalidatedAndSkippedCount  = $resumedSettingCount
+                ReappliedCheckpointCount    = @($resumeState.RetryIds).Count
+                ScheduledMutationCount      = $mutationEntries.Count
+            }) -Force
+        }
         $verificationPath = Get-VerificationReportPath -Root $StateRoot -SnapshotPath $fullPath
         $verificationLines = Get-VerificationReportLines -Verification $verification -SnapshotPath $fullPath
         $wdacVerificationPath = Get-WdacVerificationReportPath -VerificationPath $verificationPath
@@ -10235,6 +10751,8 @@ switch ($Command) {
                 if ([string]::IsNullOrWhiteSpace($SnapshotPath)) {
                     $SnapshotPath = Get-DefaultSnapshotPath -Root $StateRoot
                 }
+                $preflightDefinitions = @(Get-SelectedDefenseDefinitions -IncludeId $IncludeId -ExcludeId $ExcludeId)
+                $null = Invoke-WinDefStatePreflight -Action Snapshot -Items $preflightDefinitions -Root $StateRoot -SnapshotPath $SnapshotPath
                 $export = Export-DefenseSnapshot -Path $SnapshotPath -IncludeId $IncludeId -ExcludeId $ExcludeId -CancellationPath $CancellationPath
                 Write-Host "Snapshot JSON saved to: $($export.JsonPath)"
                 Write-Host "Snapshot report saved to: $($export.ReportPath)"

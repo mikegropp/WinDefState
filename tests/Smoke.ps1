@@ -125,6 +125,8 @@ $approvalArguments = @(Get-WinDefStateArguments -Command Restore -SnapshotPath '
 $approvalIndex = [Array]::IndexOf($approvalArguments, '-MutationApprovalPath')
 Assert-SmokeEqual -Actual ($approvalIndex -gt -1) -Expected $true -Message 'The GUI omitted its mutation approval path.'
 Assert-SmokeEqual -Actual $approvalArguments[$approvalIndex + 1] -Expected 'C:\ProgramData\WinDefState\.review-0123456789abcdef0123456789abcdef.approve' -Message 'The GUI changed its mutation approval path in transport.'
+$unscopedArguments = @(Get-WinDefStateArguments -Command Snapshot)
+Assert-SmokeEqual -Actual ([Array]::IndexOf($unscopedArguments, '-IncludeId')) -Expected -1 -Message 'The GUI emitted an empty selected-ID argument.'
 Assert-SmokeEqual -Actual ($guiText -notmatch '\.Kill\(') -Expected $true -Message 'The GUI can terminate the engine during an unsafe mutation phase.'
 Assert-SmokeEqual -Actual ($guiText -match '\$PermissiveButton\.IsEnabled\s*=\s*-not\s+\$Running\s+-and\s+-not\s+\$journalExists') -Expected $true -Message 'GUI permits a second permissive run while a journal exists.'
 Assert-SmokeEqual -Actual ($guiText -match '\$state\.PSObject\.Properties\[''Captured''\].*-not\s+\[bool\]\$state\.Captured') -Expected $true -Message 'GUI does not flag nested incomplete provider state.'
@@ -136,6 +138,10 @@ Assert-SmokeEqual -Actual ($guiText -match '\$unavailableRows\s*=\s*@\(') -Expec
 Assert-SmokeEqual -Actual ($guiText -match 'WDS_REVIEW\\\|') -Expected $true -Message 'GUI does not consume the engine pre-change review handshake.'
 Assert-SmokeEqual -Actual ($guiText -match 'x:Name="HistoryCombo"') -Expected $true -Message 'GUI snapshot history is missing.'
 Assert-SmokeEqual -Actual ($guiText -match 'x:Name="ChangedOnlyCheckBox"') -Expected $true -Message 'GUI changed-only comparison filter is missing.'
+Assert-SmokeEqual -Actual ($guiText -notmatch 'FocusVisualStyle" Value="\{x:Null\}"') -Expected $true -Message 'GUI suppresses the keyboard focus indicator.'
+Assert-SmokeEqual -Actual ($guiText -match 'x:Name="SnapshotButton" AutomationProperties.Name="Snapshot only"') -Expected $true -Message 'GUI primary snapshot action lacks an accessible name.'
+Assert-SmokeEqual -Actual ($guiText -match 'x:Name="SearchBox" AutomationProperties.Name="Search settings"') -Expected $true -Message 'GUI settings search lacks an accessible name.'
+Assert-SmokeEqual -Actual ($guiText -match 'x:Name="RunSelectedButton"[^>]+AutomationProperties.Name="Run selected setting actions"') -Expected $true -Message 'GUI selected-action control lacks an accessible name.'
 Write-Host '[smoke 3/6] GUI command contracts passed'
 
 $childProcessFunction = (Get-Command Invoke-ChildPowerShell -CommandType Function).Definition
@@ -163,6 +169,9 @@ Assert-SmokeEqual -Actual ($engineText -match "Join-Path\s+\`$env:ProgramData\s+
 Assert-SmokeEqual -Actual ($guiText -match "Join-Path\s+\`$env:ProgramData\s+'WinDefState'") -Expected $true -Message 'GUI and engine state roots do not share the ProgramData default.'
 Assert-SmokeEqual -Actual ($engineText -match 'Protect-StateRoot\s+-Path\s+\$StateRoot') -Expected $true -Message 'Public commands do not secure the trusted state root.'
 Assert-SmokeEqual -Actual ($engineText -match 'Clear-SnapshotAssetCache\s*\r?\n\s*\$operationLock') -Expected $true -Message 'Public operations can reuse stale snapshot sidecar content.'
+Assert-SmokeEqual -Actual ((@([regex]::Matches($engineText, 'Invoke-WinDefStatePreflight\s+-Action'))).Count) -Expected 4 -Message 'One or more command paths omit automatic preflight diagnostics.'
+Assert-SmokeEqual -Actual ($engineText -match 'Start-RestoreCheckpointWorkItem[\s\S]*Invoke-RestoreMutationWorkItem[\s\S]*Complete-RestoreCheckpointWorkItem') -Expected $true -Message 'Restore work is not durably checkpointed around mutation.'
+Assert-SmokeEqual -Actual ($engineText -match 'Get-RestoreCheckpointResumeState') -Expected $true -Message 'Restore does not revalidate completed checkpoints before resume.'
 Assert-SmokeEqual -Actual ((Get-Command Protect-StateRoot -CommandType Function).Definition -match 'SetAccessRuleProtection\(\$true,\s*\$false\)') -Expected $true -Message 'State-root ACL still inherits broad parent permissions.'
 Clear-WinDefStateCommandCache
 $firstCommandResolution = Get-WinDefStateCommand -Name 'Get-Command'

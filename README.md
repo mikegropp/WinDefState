@@ -10,8 +10,10 @@ WinDefState is a PowerShell tool for Windows defense testing. It snapshots the c
 - Saves a disk-backed JSON snapshot before making changes
 - Records the exact script SHA-256 and PowerShell runtime that produced each snapshot
 - Writes a human-readable text report alongside each JSON snapshot
+- Runs an automatic compatibility preflight before each command and saves its diagnostics
 - Flags incomplete baselines and platform-managed WDAC policies in the snapshot report
 - Writes a `current-operation.json` journal so restore still knows what to do after a crash or power loss
+- Checkpoints completed and in-flight restore settings so an interrupted restore can resume conservatively
 - Applies a permissive profile for supported controls
 - Recaptures every changed provider after permissive apply and writes a permissive-check report
 - Restores the original state from the saved snapshot, not from assumptions
@@ -75,6 +77,7 @@ WinDefState is a PowerShell tool for Windows defense testing. It snapshots the c
 - Snapshot sidecar assets: `%ProgramData%\WinDefState\snapshots\HOST-YYYYMMDD-HHMMSS[-N].assets\`
 - Snapshot reports: `%ProgramData%\WinDefState\snapshots\HOST-YYYYMMDD-HHMMSS[-N].txt`
 - Active run journal: `%ProgramData%\WinDefState\current-operation.json`
+- Preflight reports: `%ProgramData%\WinDefState\preflight\HOST-YYYYMMDD-HHMMSS-COMMAND[-N].txt`
 - Permissive verification reports: `%ProgramData%\WinDefState\verification\HOST-YYYYMMDD-HHMMSS[-N]-permissive-check-YYYYMMDD-HHMMSS[-N].txt`
 - Restore verification reports: `%ProgramData%\WinDefState\verification\HOST-YYYYMMDD-HHMMSS[-N]-restore-check-YYYYMMDD-HHMMSS[-N].txt`
 - WDAC-focused restore verification reports: `%ProgramData%\WinDefState\verification\HOST-YYYYMMDD-HHMMSS[-N]-restore-check-YYYYMMDD-HHMMSS[-N]-wdac.txt`
@@ -153,6 +156,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File $script -Command Restore
 
 Each command shows native PowerShell phase progress and then prints a concise result. Add `-Verbose` only when diagnosing provider behavior. Provider command discovery is cached for the process and suppresses module auto-loading export chatter, while useful WinDefState and CIM diagnostics remain visible.
 
+Before command-specific work begins, WinDefState writes a protected preflight report covering PowerShell language mode and runtime, effective execution policy, common pending-reboot markers, operation-journal state, selected scope, and the provider commands required for that scope. Warnings are diagnostic rather than overrides: the normal exact-baseline and verification rules still decide whether a setting can be changed safely.
+
 All three commands support PowerShell's standard `-WhatIf` and `-Confirm` switches. `-WhatIf` previews the top-level operation without capturing or mutating state; it is an operator preview, not a provider validation run.
 
 `Snapshot` prints a concise report summary to the console and saves the full human-readable report to disk next to the JSON snapshot. Use `-ConsoleReport Full` when you intentionally want the entire report in the console.
@@ -166,6 +171,8 @@ The permissive-check report records expected and observed state for mismatches a
 If an active `current-operation.json` already exists, another permissive run is refused. Restore the active baseline first; otherwise a second snapshot could replace the original pre-change restore point.
 
 `Restore` reads the saved snapshot, restores every fully captured setting that has an explicit restore action, verifies that restorable state, and clears `current-operation.json` only after verification succeeds. Inventory-only entries remain visible in reports but are not scheduled as no-op mutations or allowed to create false restore mismatches. A provider exception marks the journal `RestoreFailed` and leaves it available for a retry.
+
+During restore, `current-operation.json` atomically records the attempt number, requested IDs, current work item, completed IDs, and last failure. On retry, every previously completed ID is recaptured first. Only entries that still match the saved baseline are skipped; drifted, unreadable, and in-flight entries are reapplied. Full verification still evaluates the complete requested baseline before the journal can be cleared, and the restore-check report retains the attempt and resume counts after journal cleanup.
 
 Before the first restore mutation, WinDefState loads every sidecar asset needed by the selected entries into an operation-scoped cache. AppLocker XML, exploit-protection XML, and WDAC policy bytes are therefore validated up front and reused consistently instead of being reread during journal validation, planning, mutation, and verification. New snapshots record SHA-256 digests beside each restorable sidecar reference, while older snapshots without those optional fields remain compatible. If plain `Restore` reports that no active operation exists, the previous restore may already have completed; use `-SnapshotPath` only when intentionally restoring a specific saved snapshot again.
 
@@ -231,6 +238,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -Sta -File .\WinDefState.Gui.p
 - Restore reads from the saved JSON snapshot on disk
 - `%ProgramData%\WinDefState\current-operation.json` records which snapshot should be used if the system loses power during testing or the script is updated
 - `current-operation.json` records operation status, selected setting scope, and SHA-256 hashes for the snapshot and sidecar assets
+- Restore checkpoints record requested, in-flight, completed, revalidated, and failed setting IDs after each work item
 - Snapshots and `current-operation.json` record the producing script SHA-256 and PowerShell runtime
 - New snapshots persist engine-authored permissive-target descriptions for review; this presentation metadata is excluded from history drift comparison and does not alter restore semantics
 - `current-operation.json` records permissive verification counts, mismatched IDs, pending-reboot IDs, and the verification report path

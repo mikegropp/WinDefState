@@ -1049,7 +1049,7 @@ function Get-WinDefStateArguments {
         $arguments += @('-SnapshotPath', $SnapshotPath)
     }
 
-    if (@($IncludeId).Count -gt 0) {
+    if ($null -ne $IncludeId -and $IncludeId.Length -gt 0) {
         $arguments += @('-IncludeId', (@($IncludeId) -join ','))
     }
 
@@ -1535,7 +1535,7 @@ $script:MutationPreviewXaml = @'
     </Style>
     <Style TargetType="{x:Type DataGridCell}">
       <Setter Property="Padding" Value="10,0"/><Setter Property="BorderThickness" Value="0"/>
-      <Setter Property="VerticalContentAlignment" Value="Center"/><Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+      <Setter Property="VerticalContentAlignment" Value="Center"/>
     </Style>
   </Window.Resources>
   <Grid>
@@ -1574,7 +1574,7 @@ $script:MutationPreviewXaml = @'
       </Border>
     </Grid>
     <Border Grid.Row="2" Margin="22,0" Background="#FFFFFF" BorderBrush="{StaticResource PreviewLine}" BorderThickness="1" CornerRadius="12" ClipToBounds="True">
-      <DataGrid x:Name="PreviewGrid" AutoGenerateColumns="False" CanUserAddRows="False" IsReadOnly="True" HeadersVisibility="Column"
+      <DataGrid x:Name="PreviewGrid" AutomationProperties.Name="Planned setting changes" AutoGenerateColumns="False" CanUserAddRows="False" IsReadOnly="True" HeadersVisibility="Column"
                 GridLinesVisibility="None" RowHeaderWidth="0" ColumnHeaderHeight="36" AlternationCount="2"
                 EnableRowVirtualization="True" EnableColumnVirtualization="True" VirtualizingPanel.IsVirtualizing="True"
                 VirtualizingPanel.VirtualizationMode="Recycling" ScrollViewer.CanContentScroll="True">
@@ -1606,8 +1606,10 @@ $script:MutationPreviewXaml = @'
       <Grid Margin="22,0"><Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
         <TextBlock Text="Approval applies only to this persisted snapshot and this selected scope." Foreground="#60757B" VerticalAlignment="Center"/>
         <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-          <Button x:Name="PreviewCancelButton" Content="Cancel safely" MinWidth="112" Margin="0,0,10,0"/>
-          <Button x:Name="PreviewConfirmButton" Content="Approve changes" MinWidth="145" Background="#08786A" Foreground="#FFFFFF" BorderBrush="#08786A"/>
+          <Button x:Name="PreviewCancelButton" Content="Cancel safely" AutomationProperties.Name="Cancel planned changes"
+                  AutomationProperties.HelpText="Close this review without changing live settings." MinWidth="112" Margin="0,0,10,0"/>
+          <Button x:Name="PreviewConfirmButton" Content="Approve changes" AutomationProperties.Name="Approve planned changes"
+                  AutomationProperties.HelpText="Apply the exact changes listed in this review." MinWidth="145" Background="#08786A" Foreground="#FFFFFF" BorderBrush="#08786A"/>
         </StackPanel>
       </Grid>
     </Border>
@@ -1871,7 +1873,6 @@ $xaml = @'
       <Setter Property="Padding" Value="10,0"/>
       <Setter Property="BorderThickness" Value="0"/>
       <Setter Property="VerticalContentAlignment" Value="Center"/>
-      <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
     </Style>
   </Window.Resources>
 
@@ -1948,14 +1949,17 @@ $xaml = @'
             <TextBlock Text="Three deliberate operations" Style="{StaticResource SectionTitleStyle}" Margin="0,2,0,0"/>
           </StackPanel>
           <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-            <Button x:Name="CancelButton" Content="Cancel safely" Style="{StaticResource CancelButtonStyle}"
+            <Button x:Name="CancelButton" Content="Cancel safely" AutomationProperties.Name="Cancel current operation safely"
+                    AutomationProperties.HelpText="Request cancellation at the next safe checkpoint." Style="{StaticResource CancelButtonStyle}"
                     Margin="0,0,12,0" Visibility="Collapsed" IsEnabled="False"/>
             <ProgressBar x:Name="OperationProgress" Width="260" Height="7" Foreground="{StaticResource TealBrush}"
                          VerticalAlignment="Center" Visibility="Collapsed" IsIndeterminate="True"/>
           </StackPanel>
         </Grid>
         <UniformGrid Grid.Row="1" Columns="3" Margin="0,14,0,0">
-          <Button x:Name="SnapshotButton" Style="{StaticResource RunbookButtonStyle}" Background="#173B43" Margin="0,0,8,0"
+          <Button x:Name="SnapshotButton" AutomationProperties.Name="Snapshot only"
+                  AutomationProperties.HelpText="Capture a read-only baseline and report without changing defenses."
+                  Style="{StaticResource RunbookButtonStyle}" Background="#173B43" Margin="0,0,8,0"
                   ToolTip="Capture a read-only baseline and report without changing defenses.">
             <Grid>
               <Grid.ColumnDefinitions><ColumnDefinition Width="43"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -1968,7 +1972,9 @@ $xaml = @'
               </StackPanel>
             </Grid>
           </Button>
-          <Button x:Name="PermissiveButton" Style="{StaticResource RunbookButtonStyle}" Background="#B85D24" Margin="4,0"
+          <Button x:Name="PermissiveButton" AutomationProperties.Name="Snapshot and apply permissive settings"
+                  AutomationProperties.HelpText="Capture a fresh restore point before applying every exact permissive target."
+                  Style="{StaticResource RunbookButtonStyle}" Background="#B85D24" Margin="4,0"
                   ToolTip="Capture a fresh baseline, then apply every exact permissive target.">
             <Grid>
               <Grid.ColumnDefinitions><ColumnDefinition Width="43"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -1981,7 +1987,9 @@ $xaml = @'
               </StackPanel>
             </Grid>
           </Button>
-          <Button x:Name="RestoreButton" Style="{StaticResource RunbookButtonStyle}" Background="#08786A" Margin="8,0,0,0"
+          <Button x:Name="RestoreButton" AutomationProperties.Name="Restore baseline"
+                  AutomationProperties.HelpText="Restore and verify the baseline in the active operation journal."
+                  Style="{StaticResource RunbookButtonStyle}" Background="#08786A" Margin="8,0,0,0"
                   ToolTip="Restore and verify the baseline in the active operation journal.">
             <Grid>
               <Grid.ColumnDefinitions><ColumnDefinition Width="43"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
@@ -2023,10 +2031,10 @@ $xaml = @'
               <TextBlock x:Name="SnapshotPathText" Foreground="#82938D" FontSize="9.5" TextTrimming="CharacterEllipsis" Margin="0,2,0,0"/>
             </StackPanel>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-              <Button x:Name="LoadLatestButton" Content="Latest" Margin="0,0,7,0"/>
-              <Button x:Name="BrowseButton" Content="Load..." Margin="0,0,7,0"/>
-              <Button x:Name="OpenReportButton" Content="Report" Margin="0,0,7,0"/>
-              <Button x:Name="OpenStateButton" Content="State folder"/>
+              <Button x:Name="LoadLatestButton" Content="Latest" AutomationProperties.Name="Load latest snapshot" Margin="0,0,7,0"/>
+              <Button x:Name="BrowseButton" Content="Load..." AutomationProperties.Name="Load snapshot from file" Margin="0,0,7,0"/>
+              <Button x:Name="OpenReportButton" Content="Report" AutomationProperties.Name="Open snapshot report" Margin="0,0,7,0"/>
+              <Button x:Name="OpenStateButton" Content="State folder" AutomationProperties.Name="Open protected state folder"/>
             </StackPanel>
           </Grid>
         </Border>
@@ -2037,11 +2045,13 @@ $xaml = @'
             <StackPanel Orientation="Horizontal">
               <StackPanel Width="330">
                 <TextBlock Text="SEARCH SETTINGS" Style="{StaticResource EyebrowTextStyle}" Margin="1,0,0,4"/>
-                <TextBox x:Name="SearchBox" Style="{StaticResource InputTextBoxStyle}" ToolTip="Search category, ID, type, badges, current value, or action."/>
+                <TextBox x:Name="SearchBox" AutomationProperties.Name="Search settings"
+                         AutomationProperties.HelpText="Search category, ID, type, badges, current value, or action."
+                         Style="{StaticResource InputTextBoxStyle}" ToolTip="Search category, ID, type, badges, current value, or action."/>
               </StackPanel>
               <StackPanel Width="190" Margin="12,0,0,0">
                 <TextBlock Text="CATEGORY" Style="{StaticResource EyebrowTextStyle}" Margin="1,0,0,4"/>
-                <ComboBox x:Name="CategoryFilter" Style="{StaticResource FilterComboStyle}"/>
+                <ComboBox x:Name="CategoryFilter" AutomationProperties.Name="Filter by category" Style="{StaticResource FilterComboStyle}"/>
               </StackPanel>
               <Button x:Name="ClearFilterButton" Content="Reset filter" Margin="9,20,0,0" Height="36"/>
             </StackPanel>
@@ -2071,7 +2081,9 @@ $xaml = @'
                 <StackPanel Orientation="Horizontal"><TextBlock Text="SNAPSHOT HISTORY" Style="{StaticResource EyebrowTextStyle}"/><Border Background="#E2F0EC" CornerRadius="8" Padding="6,1" Margin="7,-1,0,0"><TextBlock x:Name="HistoryCountText" Text="0" Foreground="{StaticResource TealBrush}" FontFamily="Bahnschrift SemiCondensed" FontSize="9" FontWeight="SemiBold"/></Border></StackPanel>
                 <TextBlock x:Name="ComparisonStateText" Text="Choose a snapshot to compare against the loaded baseline." Foreground="{StaticResource MutedBrush}" FontSize="9.5" TextTrimming="CharacterEllipsis" Margin="0,4,8,0"/>
               </StackPanel>
-              <ComboBox x:Name="HistoryCombo" Grid.Column="1" Height="44" VerticalContentAlignment="Center" Padding="8,3" Background="#FFFFFF" BorderBrush="#BCCBC6">
+              <ComboBox x:Name="HistoryCombo" AutomationProperties.Name="Snapshot comparison history"
+                        AutomationProperties.HelpText="Choose a snapshot to compare with the loaded baseline."
+                        Grid.Column="1" Height="44" VerticalContentAlignment="Center" Padding="8,3" Background="#FFFFFF" BorderBrush="#BCCBC6">
                 <ComboBox.ItemTemplate>
                   <DataTemplate><StackPanel><TextBlock Text="{Binding DisplayName}" Foreground="{StaticResource InkBrush}" FontWeight="SemiBold"/><TextBlock Text="{Binding DisplayMeta}" Foreground="{StaticResource MutedBrush}" FontSize="9.5"/></StackPanel></DataTemplate>
                 </ComboBox.ItemTemplate>
@@ -2082,7 +2094,7 @@ $xaml = @'
             </Grid>
             <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
               <StackPanel Orientation="Horizontal" Margin="0,0,15,0" VerticalAlignment="Center">
-                <CheckBox x:Name="ChangedOnlyCheckBox" IsEnabled="False" VerticalAlignment="Center"/>
+                <CheckBox x:Name="ChangedOnlyCheckBox" AutomationProperties.Name="Show changed settings only" IsEnabled="False" VerticalAlignment="Center"/>
                 <TextBlock Text="Changed only" Foreground="{StaticResource MutedBrush}" Margin="7,0,0,0" VerticalAlignment="Center"/>
               </StackPanel>
               <Border Background="#FFF8EC" BorderBrush="#ECD4AA" BorderThickness="1" CornerRadius="9" Padding="10,6" Margin="0,0,6,0"><StackPanel Orientation="Horizontal"><TextBlock Text="CHANGED " Style="{StaticResource EyebrowTextStyle}"/><TextBlock x:Name="ChangedCountText" Text="0" Foreground="#A4521F" FontWeight="SemiBold"/></StackPanel></Border>
@@ -2100,11 +2112,12 @@ $xaml = @'
               <Button x:Name="SelectAllButton" Content="Select permissive" Margin="0,0,7,0"/>
               <Button x:Name="ClearButton" Content="Clear selection"/>
             </StackPanel>
-            <Button x:Name="RunSelectedButton" Grid.Column="1" Content="Run selected" Style="{StaticResource FilledButtonStyle}" MinWidth="118"/>
+            <Button x:Name="RunSelectedButton" Grid.Column="1" Content="Run selected" AutomationProperties.Name="Run selected setting actions"
+                    AutomationProperties.HelpText="Review and run the actions selected in the settings grid." Style="{StaticResource FilledButtonStyle}" MinWidth="118"/>
           </Grid>
         </Border>
 
-        <DataGrid x:Name="SettingsGrid" Grid.Row="4"
+        <DataGrid x:Name="SettingsGrid" AutomationProperties.Name="Snapshot settings" Grid.Row="4"
                   AutoGenerateColumns="False" CanUserAddRows="False" CanUserDeleteRows="False"
                   IsReadOnly="False" HeadersVisibility="Column" GridLinesVisibility="None"
                   SelectionMode="Extended" SelectionUnit="FullRow" Background="#FFFFFF"
@@ -2116,7 +2129,7 @@ $xaml = @'
             <DataGridTemplateColumn Header="USE" Width="48">
               <DataGridTemplateColumn.CellTemplate>
                 <DataTemplate>
-                  <CheckBox HorizontalAlignment="Center"
+                  <CheckBox AutomationProperties.Name="Select setting" AutomationProperties.HelpText="{Binding Id}" HorizontalAlignment="Center"
                             IsChecked="{Binding Selected, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                             IsEnabled="{Binding CanRun}"/>
                 </DataTemplate>
@@ -2162,7 +2175,8 @@ $xaml = @'
             <DataGridTemplateColumn Header="ACTION" Width="164">
               <DataGridTemplateColumn.CellTemplate>
                 <DataTemplate>
-                  <ComboBox ItemsSource="{Binding ActionOptions}" SelectedItem="{Binding Action, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
+                  <ComboBox AutomationProperties.Name="Setting action" AutomationProperties.HelpText="{Binding Id}"
+                            ItemsSource="{Binding ActionOptions}" SelectedItem="{Binding Action, Mode=TwoWay, UpdateSourceTrigger=PropertyChanged}"
                             IsEnabled="{Binding CanRun}" MinWidth="140" Height="30" Padding="6,3"/>
                 </DataTemplate>
               </DataGridTemplateColumn.CellTemplate>

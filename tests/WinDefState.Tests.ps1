@@ -1867,6 +1867,116 @@ Describe 'Operation journal integrity' {
         Clear-OperationState -Root $stateRoot
         { Assert-NoActiveOperation -Root $stateRoot } | Should -Not -Throw
     }
+
+    It 'persists per-setting restore checkpoints and the in-flight failure' {
+        $stateRoot = Join-Path $TestDrive 'restore-checkpoint-state'
+        $snapshotPath = Join-Path $TestDrive 'restore-checkpoint-snapshot.json'
+        Write-TextAtomic -Path $snapshotPath -Content '{"snapshot":true}'
+        $operation = Write-OperationState -Root $stateRoot -SnapshotPath $snapshotPath -Mode Permissive
+
+        $operation = Initialize-RestoreCheckpoint -Root $stateRoot -Operation $operation -RequestedIds @('rdp.user_authentication', 'firewall.profiles')
+        $operation = Start-RestoreCheckpointWorkItem -Root $stateRoot -Operation $operation -WorkItemId 'rdp.user_authentication' -SettingIds @('rdp.user_authentication')
+        $operation = Complete-RestoreCheckpointWorkItem -Root $stateRoot -Operation $operation -SettingIds @('rdp.user_authentication')
+        $operation = Start-RestoreCheckpointWorkItem -Root $stateRoot -Operation $operation -WorkItemId 'firewall.profiles' -SettingIds @('firewall.profiles')
+        $operation = Set-RestoreCheckpointFailure -Root $stateRoot -Operation $operation -Message 'expected provider failure'
+
+        $loaded = Get-OperationState -Root $stateRoot
+        $loaded.RestoreCheckpoint.AttemptNumber | Should -Be 1
+        @($loaded.RestoreCheckpoint.RequestedIds) | Should -Contain 'rdp.user_authentication'
+        @($loaded.RestoreCheckpoint.CompletedIds) | Should -Contain 'rdp.user_authentication'
+        @($loaded.RestoreCheckpoint.CompletedIds) | Should -Not -Contain 'firewall.profiles'
+        $loaded.RestoreCheckpoint.CurrentWorkItemId | Should -Be 'firewall.profiles'
+        @($loaded.RestoreCheckpoint.CurrentIds) | Should -Contain 'firewall.profiles'
+        $loaded.RestoreCheckpoint.LastFailure.Message | Should -Be 'expected provider failure'
+
+        $operation = Initialize-RestoreCheckpoint -Root $stateRoot -Operation $loaded -RequestedIds @('rdp.user_authentication', 'firewall.profiles')
+        $operation.RestoreCheckpoint.AttemptNumber | Should -Be 2
+        @($operation.RestoreCheckpoint.CompletedIds) | Should -Contain 'rdp.user_authentication'
+        $operation.RestoreCheckpoint.CurrentWorkItemId | Should -BeNullOrEmpty
+    }
+
+    It 'resumes only checkpointed settings that still match the snapshot' {
+        $snapshotPath = Join-Path $TestDrive 'resume-snapshot.json'
+        $entries = @(
+            [PSCustomObject]@{ Id = 'rdp.user_authentication'; Type = 'RegistryValue' },
+            [PSCustomObject]@{ Id = 'firewall.profiles'; Type = 'FirewallProfiles' }
+        )
+        $snapshot = [PSCustomObject]@{ Settings = @($entries) }
+        $operation = [PSCustomObject]@{
+            RestoreCheckpoint = [PSCustomObject]@{ CompletedIds = @('rdp.user_authentication', 'firewall.profiles') }
+        }
+        Mock Test-DefenseSnapshot {
+            [PSCustomObject]@{
+                Results = @(
+                    [PSCustomObject]@{ Id = 'rdp.user_authentication'; Matches = $true; Skipped = $false },
+                    [PSCustomObject]@{ Id = 'firewall.profiles'; Matches = $false; Skipped = $false }
+                )
+            }
+        }
+
+        $resume = Get-RestoreCheckpointResumeState -Operation $operation -Snapshot $snapshot -SnapshotPath $snapshotPath -MutationEntries $entries
+
+        @($resume.CandidateIds).Count | Should -Be 2
+        @($resume.VerifiedIds) | Should -Contain 'rdp.user_authentication'
+        @($resume.VerifiedIds) | Should -Not -Contain 'firewall.profiles'
+        @($resume.RetryIds) | Should -Contain 'firewall.profiles'
+        Should -Invoke Test-DefenseSnapshot -Times 1 -Exactly -ParameterFilter {
+            @($IncludeId).Count -eq 2
+        }
+    }
+
+    It 'keeps restore resume evidence in the verification report' {
+        $verification = [PSCustomObject]@{
+            ComputerName = 'HOST'; VerifiedAtUtc = '2026-01-01T00:00:00Z'
+            MatchedCount = 2; SkippedCount = 0; IncompleteCount = 0; InventoryCount = 0; MismatchCount = 0
+            Results = @()
+            RestoreCheckpointSummary = [PSCustomObject]@{
+                AttemptNumber = 2; RequestedMutationCount = 3; PreviouslyCompletedCount = 2
+                RevalidatedAndSkippedCount = 1; ReappliedCheckpointCount = 1; ScheduledMutationCount = 2
+            }
+        }
+
+        $report = @(Get-VerificationReportLines -Verification $verification -SnapshotPath 'C:\state\baseline.json') -join "`n"
+        $report | Should -Match 'Restore attempt: 2'
+        $report | Should -Match 'Checkpointed settings skipped as matching: 1'
+        $report | Should -Match 'Checkpointed settings scheduled again: 1'
+    }
+}
+
+Describe 'Automatic preflight diagnostics' {
+    It 'maps selected providers to capture and mutation command requirements' {
+        $items = @(
+            [PSCustomObject]@{ Type = 'MpPreferenceValue' },
+            [PSCustomObject]@{ Type = 'FirewallProfiles' },
+            [PSCustomObject]@{ Type = 'RegistryValue' }
+        )
+
+        $snapshotRequirements = @(Get-WinDefStatePreflightProviderRequirements -Items $items -Action Snapshot)
+        @($snapshotRequirements.Command) | Should -Contain 'Get-MpPreference'
+        @($snapshotRequirements.Command) | Should -Contain 'Get-NetFirewallProfile'
+        @($snapshotRequirements.Command) | Should -Not -Contain 'Set-MpPreference'
+
+        $restoreRequirements = @(Get-WinDefStatePreflightProviderRequirements -Items $items -Action Restore)
+        @($restoreRequirements.Command) | Should -Contain 'Set-MpPreference'
+        @($restoreRequirements.Command) | Should -Contain 'Set-NetFirewallProfile'
+
+        $restoreOnlyList = @([PSCustomObject]@{ Type = 'MpPreferenceList' })
+        @((Get-WinDefStatePreflightProviderRequirements -Items $restoreOnlyList -Action Permissive).Command) | Should -Not -Contain 'Add-MpPreference'
+        @((Get-WinDefStatePreflightProviderRequirements -Items $restoreOnlyList -Action Restore).Command) | Should -Contain 'Add-MpPreference'
+    }
+
+    It 'renders warning details in a stable text report' {
+        $preflight = [PSCustomObject]@{
+            Action = 'Restore'; ComputerName = 'HOST'; CheckedAtUtc = '2026-01-01T00:00:00Z'
+            OverallStatus = 'Warning'; WarningCount = 1
+            Checks = @([PSCustomObject]@{ Status = 'Warning'; Name = 'Provider command: Example'; Value = 'Missing'; Detail = 'ExampleProvider' })
+        }
+
+        $lines = @(Get-WinDefStatePreflightReportLines -Preflight $preflight)
+        ($lines -join "`n") | Should -Match 'Overall status: Warning'
+        ($lines -join "`n") | Should -Match '\[WARNING\] Provider command: Example: Missing'
+        ($lines -join "`n") | Should -Match 'ExampleProvider'
+    }
 }
 
 Describe 'Registry capture batching' {
@@ -2886,11 +2996,24 @@ Describe 'GUI process argument quoting' {
         $guiText | Should -Match '\$LogBox\.Text\.Length\s+-gt\s+600000'
     }
 
+    It 'preserves visible keyboard focus and accessible operation labels' {
+        $guiText = Get-Content -LiteralPath $guiPath -Raw
+
+        $guiText | Should -Not -Match 'FocusVisualStyle" Value="\{x:Null\}"'
+        $guiText | Should -Match 'x:Name="SnapshotButton" AutomationProperties.Name="Snapshot only"'
+        $guiText | Should -Match 'x:Name="PermissiveButton" AutomationProperties.Name="Snapshot and apply permissive settings"'
+        $guiText | Should -Match 'x:Name="RestoreButton" AutomationProperties.Name="Restore baseline"'
+        $guiText | Should -Match 'x:Name="SearchBox" AutomationProperties.Name="Search settings"'
+        $guiText | Should -Match 'x:Name="HistoryCombo" AutomationProperties.Name="Snapshot comparison history"'
+        $guiText | Should -Match 'x:Name="RunSelectedButton"[^>]+AutomationProperties.Name="Run selected setting actions"'
+    }
+
     It 'instantiates the WPF tree noninteractively in Windows test and release gates' {
         $repositoryRoot = Split-Path -Parent $PSScriptRoot
         $guiText = Get-Content -LiteralPath $guiPath -Raw
         $testWorkflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github/workflows/test.yml') -Raw
         $releaseWorkflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github/workflows/release.yml') -Raw
+        $snapshotWorkflow = Get-Content -LiteralPath (Join-Path $repositoryRoot '.github/workflows/windows-snapshot.yml') -Raw
 
         $guiText | Should -Match '\[switch\]\$ValidateOnly'
         $guiText | Should -Match '\$requiredControls\s*=\s*\[ordered\]@\{'
@@ -2899,6 +3022,11 @@ Describe 'GUI process argument quoting' {
         $guiText | Should -Match 'mutation-preview visual tree is missing required control'
         $testWorkflow | Should -Match 'WinDefState\.Gui\.ps1 -ValidateOnly'
         $releaseWorkflow | Should -Match 'WinDefState\.Gui\.ps1 -ValidateOnly'
+        $testWorkflow | Should -Match 'windows-2022'
+        $testWorkflow | Should -Match 'windows-2025'
+        $testWorkflow | Should -Not -Match 'actions/checkout@v4'
+        $releaseWorkflow | Should -Not -Match 'actions/checkout@v4'
+        $snapshotWorkflow | Should -Not -Match 'actions/checkout@v4'
     }
 
     It 'disables selection and actions for rows that cannot run' {

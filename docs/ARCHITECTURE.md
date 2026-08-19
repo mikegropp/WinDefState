@@ -26,6 +26,7 @@ The default state root is the machine-wide `%ProgramData%\WinDefState` directory
 - A permissive mismatch or unreadable post-apply provider transitions the journal to `ApplyVerificationFailed`; the baseline remains restorable.
 - A full restore clears `current-operation.json` only after every fully captured restorable setting matches. Inventory-only entries remain reportable context and cannot fail restoration.
 - Provider exceptions transition the journal to `ApplyFailed` or `RestoreFailed`; the baseline remains available for a retry.
+- Restore work items are journaled before mutation and checkpointed after success. A retry recaptures completed IDs and skips only those that still match the baseline; in-flight, drifted, or unreadable IDs are reapplied.
 - An explicit restore must never update or clear a journal that points to another snapshot.
 - Only one public WinDefState operation may run on a computer at a time; the machine-wide mutex is released even when a provider throws.
 - GUI cancellation is cooperative and marker-based. Snapshot capture and pre-mutation permissive work may stop at explicit read-only boundaries; restore and started mutation are never killed or interrupted.
@@ -72,6 +73,12 @@ Exact command discovery is cached process-wide because command availability cann
 The cache is phase-local. Snapshot, permissive mutation, post-permissive verification, restore mutation, and restore verification each receive a fresh session. Mutation sessions cache only data that is safe to reuse within that phase: user-profile discovery/open hive handles, one bounded WinRM service-write scope, and one initial Defender preference read for independent list/ASR reconciliation. Setting values are still mutated and verified in a fresh post-transition session. No cache crosses a state transition.
 
 Definition filtering happens before capture-session construction. A selected-item snapshot or permissive operation therefore invokes only providers represented by the selected baseline; the filter is retained in `CaptureScope` metadata and in the permissive operation journal.
+
+## Preflight and restore recovery
+
+Every public command writes a timestamped preflight report beneath the protected state root. Preflight is intentionally lightweight: it records runtime and language mode, effective execution policy, common pending-reboot markers, journal state, selected setting count, and required provider-command availability without duplicating expensive provider captures. A warning is operator context, not permission to bypass exact-baseline or verification checks.
+
+The schema-1 operation journal is extended compatibly with an optional `RestoreCheckpoint` object. Each restore attempt preserves completed IDs from earlier attempts, records the current work item before mutation, and atomically merges successful IDs afterward. Before resuming, checkpointed IDs are verified against the snapshot in a fresh capture session. Matching IDs are omitted from the mutation plan; all others remain scheduled. The final restore verification is never narrowed by checkpoint state, and its report preserves attempt and resume counts after a successful run clears the journal.
 
 ## Distribution pipeline
 
