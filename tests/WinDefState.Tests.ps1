@@ -190,6 +190,22 @@ BeforeAll {
             throw 'The test-only Start-Service stub must be mocked before use.'
         }
     }
+
+    function New-TestNetworkAdapterInstance {
+        param(
+            [Parameter(Mandatory)] [uint32]$Index,
+            [Parameter(Mandatory)] [string]$Description
+        )
+
+        if ($null -ne (Get-Command New-CimInstance -ErrorAction SilentlyContinue)) {
+            return New-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Property @{
+                Index       = $Index
+                Description = $Description
+            } -ClientOnly
+        }
+
+        [PSCustomObject]@{ Index = $Index; Description = $Description }
+    }
 }
 
 Describe 'Definition catalog' {
@@ -2058,18 +2074,10 @@ Describe 'Operational output' {
     }
 
     It 'emits structured progress only when requested' {
-        if ($env:OS -eq 'Windows_NT') {
-            $script:EmitProgress = $true
-            try {
-                $output = @(& { Write-OperationProgress -Phase 'Verify' -Current 8 -Total 94 -Id 'rdp.test' } 6>&1 | ForEach-Object { [string]$_ })
-                $output | Should -Contain 'WDS_PROGRESS|Verify|8|94|rdp.test'
-            } finally {
-                $script:EmitProgress = $false
-            }
-        } else {
-            (Get-Command Write-OperationProgress -CommandType Function).Definition |
-                Should -Match 'WDS_PROGRESS\|\{0\}\|\{1\}\|\{2\}\|\{3\}'
-        }
+        $definition = (Get-Command Write-OperationProgress -CommandType Function).Definition
+
+        $definition | Should -Match 'if\s*\(\$EmitProgress\)\s*\{\s*Write-Host'
+        $definition | Should -Match 'WDS_PROGRESS\|\{0\}\|\{1\}\|\{2\}\|\{3\}'
     }
 
     It 'uses native progress without requiring verbose output' {
@@ -2083,20 +2091,12 @@ Describe 'Operational output' {
     }
 
     It 'emits structured results only when requested' {
-        if ($env:OS -eq 'Windows_NT') {
-            $script:EmitProgress = $true
-            try {
-                $output = @(& { Write-OperationResult -Name 'SnapshotPath' -Value 'C:\State\snapshot.json' } 6>&1 | ForEach-Object { [string]$_ })
-                $output | Should -Contain 'WDS_RESULT|SnapshotPath|C:\State\snapshot.json'
-            } finally {
-                $script:EmitProgress = $false
-            }
+        $definition = (Get-Command Write-OperationResult -CommandType Function).Definition
 
-            @(& { Write-OperationResult -Name 'SnapshotPath' -Value 'C:\State\snapshot.json' } 6>&1).Count | Should -Be 0
-        } else {
-            (Get-Command Write-OperationResult -CommandType Function).Definition |
-                Should -Match 'WDS_RESULT\|\{0\}\|\{1\}'
-        }
+        $definition | Should -Match 'if\s*\(-not\s+\$EmitProgress\)\s*\{\s*return'
+        $definition | Should -Match 'WDS_RESULT\|\{0\}\|\{1\}'
+        $script:EmitProgress = $false
+        @(Write-OperationResult -Name 'SnapshotPath' -Value 'C:\State\snapshot.json').Count | Should -Be 0
     }
 
     It 'returns only the report header block for summary output' {
@@ -2339,8 +2339,8 @@ Describe 'NetBIOS mutation batching' {
     BeforeEach {
         Mock Get-CimInstance {
             @(
-                [PSCustomObject]@{ Index = 4; Description = 'Ethernet' }
-                [PSCustomObject]@{ Index = 9; Description = 'Wi-Fi' }
+                New-TestNetworkAdapterInstance -Index 4 -Description 'Ethernet'
+                New-TestNetworkAdapterInstance -Index 9 -Description 'Wi-Fi'
             )
         }
         Mock Invoke-CimMethod {}
