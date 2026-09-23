@@ -16,7 +16,7 @@ Describe 'Release builder' {
             Should -Be (Get-Content -LiteralPath $second.ManifestPath -Raw)
 
         $manifestLines = @(Get-Content -LiteralPath $first.ManifestPath | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        $manifestLines.Count | Should -Be 3
+        $manifestLines.Count | Should -Be 6
         foreach ($line in $manifestLines) {
             $match = [regex]::Match($line, '^([a-f0-9]{64})  (.+)$')
             $match.Success | Should -BeTrue
@@ -33,8 +33,14 @@ Describe 'Release builder' {
             $entryNames = @($archive.Entries | ForEach-Object { $_.FullName })
             $entryNames | Should -Contain 'WinDefState-v1.2.3-test/WinDefState.ps1'
             $entryNames | Should -Contain 'WinDefState-v1.2.3-test/WinDefState.Gui.ps1'
+            $entryNames | Should -Contain 'WinDefState-v1.2.3-test/WinDefState.Health.ps1'
+            $entryNames | Should -Contain 'WinDefState-v1.2.3-test/WinDefState.Environment.ps1'
+            $entryNames | Should -Contain 'WinDefState-v1.2.3-test/WinDefState.Inspect.Gui.ps1'
+            $entryNames | Should -Contain 'WinDefState-v1.2.3-test/docs/INSPECTION.md'
             $entryNames | Should -Contain 'WinDefState-v1.2.3-test/SHA256SUMS.txt'
-            @($archive.Entries | Where-Object { $_.LastWriteTime.UtcDateTime -ne [datetime]'1980-01-01T00:00:00Z' }).Count | Should -Be 0
+            # ZIP stores a DOS wall-clock timestamp without a time-zone offset.
+            # Reading it in a non-UTC locale must not fail reproducibility checks.
+            @($archive.Entries | Where-Object { $_.LastWriteTime.DateTime -ne [datetime]'1980-01-01T00:00:00' }).Count | Should -Be 0
         } finally {
             $archive.Dispose()
         }

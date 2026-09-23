@@ -9,8 +9,12 @@ $settingsPath = Join-Path $repositoryRoot 'PSScriptAnalyzerSettings.psd1'
 $scriptPaths = @(
     Join-Path $repositoryRoot 'WinDefState.ps1'
     Join-Path $repositoryRoot 'WinDefState.Gui.ps1'
+    Join-Path $repositoryRoot 'WinDefState.Health.ps1'
+    Join-Path $repositoryRoot 'WinDefState.Environment.ps1'
+    Join-Path $repositoryRoot 'WinDefState.Inspect.Gui.ps1'
     Join-Path $repositoryRoot 'build/Build-Release.ps1'
     Join-Path $repositoryRoot 'tests/WindowsSnapshot.ps1'
+    Join-Path $repositoryRoot 'tests/InspectionGui.ps1'
 )
 
 if ($null -eq (Get-Command Invoke-ScriptAnalyzer -ErrorAction SilentlyContinue)) {

@@ -51,6 +51,9 @@ jobs:
       - name: Instantiate and validate the WPF visual tree
         shell: powershell
         run: powershell.exe -NoProfile -ExecutionPolicy Bypass -Sta -File .\WinDefState.Gui.ps1 -ValidateOnly
+      - name: Validate the read-only inspection dashboard
+        shell: powershell
+        run: powershell.exe -NoProfile -Sta -File .\tests\InspectionGui.ps1
       - name: Install test dependencies
         shell: powershell
         run: |
