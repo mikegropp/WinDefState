@@ -1,5 +1,27 @@
 # WinDefState
 
+## Capture the environment before testing
+
+The read-only inspection dashboard captures local TCP listeners and UDP endpoints
+with process ownership, effective firewall rules and filters, network configuration,
+services, scheduled tasks, machine software, hotfixes, and Windows protection health.
+Save JSON before and after testing to compare added, removed, changed, and unreadable
+sections. Shareable HTML reports include search and evidence details.
+
+```powershell
+powershell.exe -NoProfile -Sta -File .\WinDefState.Inspect.Gui.ps1
+```
+
+Keep all three inspection scripts from the release bundle together. For a CLI
+baseline, run `.\WinDefState.Environment.ps1 -OutputPath .\before.json`.
+See the [inspection guide](docs/INSPECTION.md) for capture coverage, comparison,
+Windows 10/11 lifecycle handling, permissions, and limitations. This configuration
+baseline complements a VM checkpoint or disk image; it cannot restore the whole OS.
+
+![Read-only environment dashboard with synthetic demonstration data](docs/inspection-dashboard.png)
+
+## State engine
+
 WinDefState is a PowerShell tool for Windows defense testing. It snapshots the current host protection state to disk, switches supported controls to a permissive test posture, and restores the original state from the saved snapshot. When a provider does not yield an exact baseline, WinDefState records that explicitly and skips that setting during permissive, restore, and verification instead of guessing.
 
 > [!WARNING]

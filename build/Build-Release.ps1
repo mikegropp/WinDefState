@@ -78,15 +78,18 @@ $archivePath = Join-Path $fullOutputPath "$packageName.zip"
 $manifestPath = Join-Path $fullOutputPath "$packageName-SHA256SUMS.txt"
 $looseEnginePath = Join-Path $fullOutputPath 'WinDefState.ps1'
 $looseGuiPath = Join-Path $fullOutputPath 'WinDefState.Gui.ps1'
+$inspectionFiles = @('WinDefState.Health.ps1', 'WinDefState.Environment.ps1', 'WinDefState.Inspect.Gui.ps1')
+$inspectionTargets = @($inspectionFiles | ForEach-Object { Join-Path $fullOutputPath $_ })
+$sourceRelativePaths = @('WinDefState.ps1', 'WinDefState.Gui.ps1', 'README.md', 'docs/ARCHITECTURE.md', 'docs/INSPECTION.md', 'docs/inspection-dashboard.png') + $inspectionFiles
 
-foreach ($sourceRelativePath in @('WinDefState.ps1', 'WinDefState.Gui.ps1', 'README.md', 'docs/ARCHITECTURE.md')) {
+foreach ($sourceRelativePath in $sourceRelativePaths) {
     $sourcePath = Join-Path $repositoryRoot $sourceRelativePath
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) {
         throw "Release source file is missing: $sourcePath"
     }
 }
 
-foreach ($targetPath in @($packagePath, $archivePath, $manifestPath, $looseEnginePath, $looseGuiPath)) {
+foreach ($targetPath in (@($packagePath, $archivePath, $manifestPath, $looseEnginePath, $looseGuiPath) + $inspectionTargets)) {
     if (Test-Path -LiteralPath $targetPath) {
         throw "Release target already exists: $targetPath"
     }
@@ -95,27 +98,31 @@ foreach ($targetPath in @($packagePath, $archivePath, $manifestPath, $looseEngin
 New-Item -ItemType Directory -Path $fullOutputPath -Force | Out-Null
 New-Item -ItemType Directory -Path (Join-Path $packagePath 'docs') -Force | Out-Null
 
-Copy-Item -LiteralPath (Join-Path $repositoryRoot 'WinDefState.ps1') -Destination (Join-Path $packagePath 'WinDefState.ps1')
-Copy-Item -LiteralPath (Join-Path $repositoryRoot 'WinDefState.Gui.ps1') -Destination (Join-Path $packagePath 'WinDefState.Gui.ps1')
-Copy-Item -LiteralPath (Join-Path $repositoryRoot 'README.md') -Destination (Join-Path $packagePath 'README.md')
-Copy-Item -LiteralPath (Join-Path $repositoryRoot 'docs/ARCHITECTURE.md') -Destination (Join-Path $packagePath 'docs/ARCHITECTURE.md')
+foreach ($relativePath in $sourceRelativePaths) {
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot $relativePath) -Destination (Join-Path $packagePath $relativePath)
+}
 
 $packageHashLines = @(
-    Get-ReleaseHashLine -Path (Join-Path $packagePath 'README.md') -Name 'README.md'
-    Get-ReleaseHashLine -Path (Join-Path $packagePath 'WinDefState.Gui.ps1') -Name 'WinDefState.Gui.ps1'
-    Get-ReleaseHashLine -Path (Join-Path $packagePath 'WinDefState.ps1') -Name 'WinDefState.ps1'
-    Get-ReleaseHashLine -Path (Join-Path $packagePath 'docs/ARCHITECTURE.md') -Name 'docs/ARCHITECTURE.md'
+    foreach ($relativePath in @($sourceRelativePaths | Sort-Object)) {
+        Get-ReleaseHashLine -Path (Join-Path $packagePath $relativePath) -Name $relativePath
+    }
 )
 Write-Utf8NoBomText -Path (Join-Path $packagePath 'SHA256SUMS.txt') -Content (($packageHashLines -join "`n") + "`n")
 
 New-DeterministicZip -SourcePath $packagePath -DestinationPath $archivePath -RootName $packageName
 Copy-Item -LiteralPath (Join-Path $repositoryRoot 'WinDefState.ps1') -Destination $looseEnginePath
 Copy-Item -LiteralPath (Join-Path $repositoryRoot 'WinDefState.Gui.ps1') -Destination $looseGuiPath
+foreach ($relativePath in $inspectionFiles) {
+    Copy-Item -LiteralPath (Join-Path $repositoryRoot $relativePath) -Destination (Join-Path $fullOutputPath $relativePath)
+}
 
 $releaseHashLines = @(
     Get-ReleaseHashLine -Path $looseGuiPath -Name 'WinDefState.Gui.ps1'
     Get-ReleaseHashLine -Path $looseEnginePath -Name 'WinDefState.ps1'
     Get-ReleaseHashLine -Path $archivePath -Name ([IO.Path]::GetFileName($archivePath))
+    foreach ($relativePath in $inspectionFiles) {
+        Get-ReleaseHashLine -Path (Join-Path $fullOutputPath $relativePath) -Name $relativePath
+    }
 )
 Write-Utf8NoBomText -Path $manifestPath -Content (($releaseHashLines -join "`n") + "`n")
 

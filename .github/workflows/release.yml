@@ -31,6 +31,10 @@ jobs:
             throw "WPF visual-tree validation failed with exit code $LASTEXITCODE."
           }
           .\tests\Analyze.ps1
+          & powershell.exe -NoProfile -Sta -File .\tests\InspectionGui.ps1
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inspection dashboard validation failed with exit code $LASTEXITCODE."
+          }
           Import-Module Pester -RequiredVersion 5.7.1
           Invoke-Pester -Path .\tests -CI
       - name: Build deterministic release assets
@@ -46,6 +50,9 @@ jobs:
           $assets = @(
             '.\dist\WinDefState.ps1'
             '.\dist\WinDefState.Gui.ps1'
+            '.\dist\WinDefState.Health.ps1'
+            '.\dist\WinDefState.Environment.ps1'
+            '.\dist\WinDefState.Inspect.Gui.ps1'
             ".\dist\WinDefState-$tag.zip"
             ".\dist\WinDefState-$tag-SHA256SUMS.txt"
           )
