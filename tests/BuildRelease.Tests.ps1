@@ -37,6 +37,8 @@ Describe 'Release builder' {
             $entryNames | Should -Contain 'WinDefState-v1.2.3-test/WinDefState.Environment.ps1'
             $entryNames | Should -Contain 'WinDefState-v1.2.3-test/WinDefState.Inspect.Gui.ps1'
             $entryNames | Should -Contain 'WinDefState-v1.2.3-test/docs/INSPECTION.md'
+            $entryNames | Should -Contain 'WinDefState-v1.2.3-test/docs/STATE.md'
+            $entryNames | Should -Contain 'WinDefState-v1.2.3-test/docs/DEVELOPMENT.md'
             $entryNames | Should -Contain 'WinDefState-v1.2.3-test/SHA256SUMS.txt'
             # ZIP stores a DOS wall-clock timestamp without a time-zone offset.
             # Reading it in a non-UTC locale must not fail reproducibility checks.

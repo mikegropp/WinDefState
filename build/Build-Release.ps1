@@ -80,7 +80,7 @@ $looseEnginePath = Join-Path $fullOutputPath 'WinDefState.ps1'
 $looseGuiPath = Join-Path $fullOutputPath 'WinDefState.Gui.ps1'
 $inspectionFiles = @('WinDefState.Health.ps1', 'WinDefState.Environment.ps1', 'WinDefState.Inspect.Gui.ps1')
 $inspectionTargets = @($inspectionFiles | ForEach-Object { Join-Path $fullOutputPath $_ })
-$sourceRelativePaths = @('WinDefState.ps1', 'WinDefState.Gui.ps1', 'README.md', 'docs/ARCHITECTURE.md', 'docs/INSPECTION.md', 'docs/inspection-dashboard.png') + $inspectionFiles
+$sourceRelativePaths = @('WinDefState.ps1', 'WinDefState.Gui.ps1', 'README.md', 'docs/ARCHITECTURE.md', 'docs/INSPECTION.md', 'docs/STATE.md', 'docs/DEVELOPMENT.md', 'docs/inspection-dashboard.png') + $inspectionFiles
 
 foreach ($sourceRelativePath in $sourceRelativePaths) {
     $sourcePath = Join-Path $repositoryRoot $sourceRelativePath

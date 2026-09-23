@@ -16,17 +16,18 @@ the dashboard does not request elevation or change policy on your behalf.
 powershell.exe -NoProfile -Sta -File .\WinDefState.Inspect.Gui.ps1
 ```
 
-1. Click **Capture environment** and review the unreadable-section count.
-2. Export a **JSON** baseline before testing. Save it in a restricted location.
-3. Capture again after testing and export a second JSON baseline.
-4. Choose **Compare with before...** and open the first baseline. The currently
+1. Click **Capture** and review the unavailable-section count.
+2. Choose **Save baseline...** and save JSON before testing in a restricted location.
+3. Capture again after testing and save a second JSON baseline.
+4. Choose **Compare...** and open the first baseline. The currently
    loaded baseline is the after-state. Select a difference to see both values.
-5. Export the comparison from the **Changes since baseline** tab, or select the
-   inventory/health tab to export the complete currently loaded baseline.
+5. Choose **Save comparison...** from the **Changes** tab, or select **Inventory**
+   or **Security** to save the complete loaded baseline.
 
 The search field matches all words across the fields in the selected section or
-view. Inventory sections display `?` when unreadable, and empty successful reads
-display `0`. The evidence pane is selectable and can be resized. Capture runs in
+view; **Ctrl+F** focuses search. Inventory sections display `?` when unreadable,
+and empty successful reads display `0`. The status bar shows the visible record
+count. The Details pane is selectable and can be resized. Capture runs in
 a separate hidden read-only process, with cancellation and a 180-second UI
 deadline. Cancelling retains the previously loaded baseline. An unsaved capture
 is held only for this session; export it before closing.
