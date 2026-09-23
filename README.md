@@ -21,10 +21,9 @@ powershell.exe -NoProfile -Sta -File .\WinDefState.Inspect.Gui.ps1
 Requires Windows 10 or 11 and 64-bit Windows PowerShell 5.1. Run as administrator
 for complete firewall reads. Unavailable data is marked **Unknown**.
 
-**Capture → Save baseline → Test → Capture → Compare**
-
-The inspection UI is read-only. Baselines record configuration; use a VM checkpoint
-or disk backup for whole-machine recovery.
+The inspection UI saves environment inventory to JSON without changing Windows
+settings. These files support comparison only. Use a VM checkpoint or disk backup
+to restore the whole machine.
 
 ## Command line
 
