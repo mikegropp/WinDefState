@@ -31,4 +31,7 @@ $script:InspectionReport.Sections[2].Items[0].Data.Action = 'Block'
 $script:InspectionDiff = Compare-EnvironmentBaseline $before $script:InspectionReport
 Update-InspectionFilter
 if (@($controls.DiffGrid.Items | Where-Object Change -eq Changed).Count -ne 1) { throw 'The comparison grid did not display the changed rule.' }
+$script:InspectionReport.Health.Summary.Unknown = 2
+Set-InspectionReport $script:InspectionReport
+if ($controls.AttentionCount.Text -ne '2') { throw 'Unknown health checks were omitted from the review count.' }
 Write-Output 'Inspection dashboard search, section, evidence and comparison checks passed.'

@@ -123,7 +123,8 @@ function Set-InspectionReport {
     $controls.ListenersCount.Text = $counts -join ' / '
     $rules = @($Report.Sections | Where-Object Id -eq 'firewall.rules')
     $controls.RulesCount.Text = if ($rules.Count -eq 1 -and $rules[0].Status -eq 'Captured') { [string]@($rules[0].Items).Count } else { '?' }
-    $controls.AttentionCount.Text = [string]$Report.Health.Summary.Attention
+    $controls.AttentionCount.Text = [string]([int]$Report.Health.Summary.Attention + [int]$Report.Health.Summary.Unknown)
+    $controls.AttentionCount.ToolTip = '{0} need attention; {1} unknown checks.' -f $Report.Health.Summary.Attention, $Report.Health.Summary.Unknown
     $controls.UnknownCount.Text = [string]@($Report.Sections | Where-Object Status -eq Unknown).Count
     $controls.SectionList.ItemsSource = @($Report.Sections | ForEach-Object { [pscustomobject]@{ Label = '{0} ({1})' -f $_.Name, $(if ($_.Status -eq 'Captured') { @($_.Items).Count } else { '?' }); Section = $_ } })
     $controls.SectionList.SelectedIndex = 0
