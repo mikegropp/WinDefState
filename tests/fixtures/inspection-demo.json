@@ -1,0 +1,410 @@
+{
+  "SchemaVersion": 1,
+  "ReportType": "WinDefState.Environment",
+  "ComputerName": "LAB-WIN11 (DEMO)",
+  "StartedAtUtc": "2026-09-23T10:00:00Z",
+  "CapturedAtUtc": "2026-09-23T10:00:10Z",
+  "Elevated": false,
+  "Health": {
+    "SchemaVersion": 1,
+    "ReportType": "WinDefState.Health",
+    "ComputerName": "LAB-WIN11 (DEMO)",
+    "CapturedAtUtc": "2026-09-23T10:00:00Z",
+    "Windows": {
+      "Family": "Windows 11",
+      "Edition": "Professional",
+      "Release": "25H2",
+      "Build": 26200,
+      "Revision": 100,
+      "Architecture": "64-bit",
+      "LifecycleStatus": "Healthy",
+      "ServicingEnd": "2027-10-12",
+      "LifecycleDetail": "Published servicing end: 2027-10-12. This does not verify installed updates.",
+      "LifecycleSource": "https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information",
+      "LifecycleReviewedOn": "2026-09-23"
+    },
+    "Summary": {
+      "Healthy": 13,
+      "Attention": 0,
+      "Unknown": 0,
+      "Info": 2
+    },
+    "Checks": [
+      {
+        "Id": "os.lifecycle",
+        "Category": "Windows",
+        "Name": "Windows servicing",
+        "Status": "Healthy",
+        "Value": "Windows 11 25H2 Professional",
+        "Detail": "Published servicing end: 2027-10-12. This does not verify installed updates.",
+        "Source": "https://learn.microsoft.com/en-us/windows/release-health/windows11-release-information"
+      },
+      {
+        "Id": "defender.mode",
+        "Category": "Defender",
+        "Name": "Antivirus running mode",
+        "Status": "Info",
+        "Value": "Normal",
+        "Detail": "Passive or EDR block mode needs context from the primary antivirus provider; this is not an antivirus compliance score.",
+        "Source": "Get-MpComputerStatus"
+      },
+      {
+        "Id": "defender.realtime",
+        "Category": "Defender",
+        "Name": "Real-time protection",
+        "Status": "Healthy",
+        "Value": "Enabled",
+        "Detail": "Observed runtime state. Managed policy can differ from local preferences.",
+        "Source": "Get-MpComputerStatus"
+      },
+      {
+        "Id": "defender.behavior",
+        "Category": "Defender",
+        "Name": "Behavior monitoring",
+        "Status": "Healthy",
+        "Value": "Enabled",
+        "Detail": "Observed runtime state. Managed policy can differ from local preferences.",
+        "Source": "Get-MpComputerStatus"
+      },
+      {
+        "Id": "defender.tamper",
+        "Category": "Defender",
+        "Name": "Tamper protection",
+        "Status": "Healthy",
+        "Value": "Enabled",
+        "Detail": "Observed runtime state. Managed policy can differ from local preferences.",
+        "Source": "Get-MpComputerStatus"
+      },
+      {
+        "Id": "defender.signatures",
+        "Category": "Defender",
+        "Name": "Security intelligence age",
+        "Status": "Healthy",
+        "Value": "24.0 hours",
+        "Detail": "Advisory threshold: 7 days. Future timestamps are unknown; check the system clock. This does not compare against the latest online definition.",
+        "Source": "Get-MpComputerStatus"
+      },
+      {
+        "Id": "firmware.secureboot",
+        "Category": "Firmware",
+        "Name": "Secure Boot",
+        "Status": "Healthy",
+        "Value": "Enabled",
+        "Detail": "Observed UEFI state. Access-denied and unsupported firmware are unknown, not disabled.",
+        "Source": "Confirm-SecureBootUEFI"
+      },
+      {
+        "Id": "firmware.tpm",
+        "Category": "Firmware",
+        "Name": "TPM ready",
+        "Status": "Healthy",
+        "Value": "Enabled",
+        "Detail": "TPM readiness does not certify TPM 2.0 or Windows 11 hardware eligibility.",
+        "Source": "Get-Tpm"
+      },
+      {
+        "Id": "virtualization.credentialguard",
+        "Category": "Virtualization",
+        "Name": "Credential Guard",
+        "Status": "Healthy",
+        "Value": "Running",
+        "Detail": "Runtime observation from Win32_DeviceGuard. Configured does not imply active; review hardware, policy and restart requirements.",
+        "Source": "Win32_DeviceGuard"
+      },
+      {
+        "Id": "virtualization.memoryintegrity",
+        "Category": "Virtualization",
+        "Name": "Memory integrity (HVCI)",
+        "Status": "Healthy",
+        "Value": "Running",
+        "Detail": "Runtime observation from Win32_DeviceGuard. Configured does not imply active; review hardware, policy and restart requirements.",
+        "Source": "Win32_DeviceGuard"
+      },
+      {
+        "Id": "virtualization.vbs",
+        "Category": "Virtualization",
+        "Name": "Virtualization-based security",
+        "Status": "Healthy",
+        "Value": "Running",
+        "Detail": "Runtime state, not a registry-policy inference.",
+        "Source": "Win32_DeviceGuard"
+      },
+      {
+        "Id": "firewall.domain",
+        "Category": "Firewall",
+        "Name": "Domain firewall",
+        "Status": "Healthy",
+        "Value": "Enabled",
+        "Detail": "Effective profile configuration from ActiveStore; a profile need not be connected. Firewall rules are not assessed.",
+        "Source": "Get-NetFirewallProfile -PolicyStore ActiveStore"
+      },
+      {
+        "Id": "firewall.private",
+        "Category": "Firewall",
+        "Name": "Private firewall",
+        "Status": "Healthy",
+        "Value": "Enabled",
+        "Detail": "Effective profile configuration from ActiveStore; a profile need not be connected. Firewall rules are not assessed.",
+        "Source": "Get-NetFirewallProfile -PolicyStore ActiveStore"
+      },
+      {
+        "Id": "firewall.public",
+        "Category": "Firewall",
+        "Name": "Public firewall",
+        "Status": "Healthy",
+        "Value": "Enabled",
+        "Detail": "Effective profile configuration from ActiveStore; a profile need not be connected. Firewall rules are not assessed.",
+        "Source": "Get-NetFirewallProfile -PolicyStore ActiveStore"
+      },
+      {
+        "Id": "windows.reboot",
+        "Category": "Windows",
+        "Name": "Pending restart",
+        "Status": "Info",
+        "Value": "No common markers",
+        "Detail": "Common CBS, Windows Update and pending file-rename markers only; not an exhaustive restart assessment. ",
+        "Source": "Local registry"
+      }
+    ],
+    "Providers": [
+      {
+        "Name": "Defender",
+        "Success": true,
+        "DurationMs": 1,
+        "Error": ""
+      },
+      {
+        "Name": "DeviceGuard",
+        "Success": true,
+        "DurationMs": 1,
+        "Error": ""
+      },
+      {
+        "Name": "Firewall",
+        "Success": true,
+        "DurationMs": 1,
+        "Error": ""
+      },
+      {
+        "Name": "OS",
+        "Success": true,
+        "DurationMs": 1,
+        "Error": ""
+      },
+      {
+        "Name": "Reboot",
+        "Success": true,
+        "DurationMs": 1,
+        "Error": ""
+      },
+      {
+        "Name": "SecureBoot",
+        "Success": true,
+        "DurationMs": 1,
+        "Error": ""
+      },
+      {
+        "Name": "Tpm",
+        "Success": true,
+        "DurationMs": 1,
+        "Error": ""
+      },
+      {
+        "Name": "Version",
+        "Success": true,
+        "DurationMs": 1,
+        "Error": ""
+      }
+    ]
+  },
+  "ProcessInventoryError": "",
+  "Sections": [
+    {
+      "Id": "network.tcp",
+      "Name": "TCP listeners",
+      "Status": "Captured",
+      "Error": "",
+      "DurationMs": 57,
+      "IgnoreForComparison": [],
+      "Items": [
+        {
+          "Key": "[\"::1\",\"443\",\"1200\"]",
+          "Data": {
+            "ExecutablePath": "C:\\Apps\\ExampleWeb.exe",
+            "LocalAddress": "::1",
+            "LocalPort": 443,
+            "OwnerStatus": "Resolved",
+            "ProcessId": 1200,
+            "ProcessName": "ExampleWeb",
+            "Protocol": "TCP"
+          }
+        },
+        {
+          "Key": "[\"0.0.0.0\",\"8080\",\"1400\"]",
+          "Data": {
+            "ExecutablePath": "C:\\Lab\\Service.exe",
+            "LocalAddress": "0.0.0.0",
+            "LocalPort": 8080,
+            "OwnerStatus": "Resolved",
+            "ProcessId": 1400,
+            "ProcessName": "LabService",
+            "Protocol": "TCP"
+          }
+        },
+        {
+          "Key": "[\"127.0.0.1\",\"443\",\"1200\"]",
+          "Data": {
+            "ExecutablePath": "C:\\Apps\\ExampleWeb.exe",
+            "LocalAddress": "127.0.0.1",
+            "LocalPort": 443,
+            "OwnerStatus": "Resolved",
+            "ProcessId": 1200,
+            "ProcessName": "ExampleWeb",
+            "Protocol": "TCP"
+          }
+        }
+      ]
+    },
+    {
+      "Id": "network.udp",
+      "Name": "UDP bound endpoints",
+      "Status": "Captured",
+      "Error": "",
+      "DurationMs": 9,
+      "IgnoreForComparison": [],
+      "Items": [
+        {
+          "Key": "[\"5353\"]",
+          "Data": {
+            "LocalAddress": "127.0.0.1",
+            "LocalPort": 5353,
+            "ProcessId": 2200,
+            "ProcessName": "ExampleDNS",
+            "Protocol": "UDP"
+          }
+        }
+      ]
+    },
+    {
+      "Id": "firewall.rules",
+      "Name": "Effective firewall rules",
+      "Status": "Captured",
+      "Error": "",
+      "DurationMs": 9,
+      "IgnoreForComparison": [],
+      "Items": [
+        {
+          "Key": "[\"Example-Web-In\"]",
+          "Data": {
+            "Action": "Allow",
+            "Direction": "Inbound",
+            "DisplayName": "Example web service",
+            "Enabled": "True",
+            "Name": "Example-Web-In",
+            "Profile": "Private"
+          }
+        }
+      ]
+    },
+    {
+      "Id": "firewall.ports",
+      "Name": "Firewall port filters",
+      "Status": "Captured",
+      "Error": "",
+      "DurationMs": 11,
+      "IgnoreForComparison": [],
+      "Items": [
+        {
+          "Key": "[\"Example-Web-In\"]",
+          "Data": {
+            "InstanceID": "Example-Web-In",
+            "LocalPort": [
+              "443"
+            ],
+            "Protocol": "TCP",
+            "RemotePort": [
+              "Any"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "Id": "network.dns",
+      "Name": "DNS server configuration",
+      "Status": "Captured",
+      "Error": "",
+      "DurationMs": 9,
+      "IgnoreForComparison": [],
+      "Items": [
+        {
+          "Key": "[\"7\"]",
+          "Data": {
+            "InterfaceAlias": "Lab network",
+            "InterfaceIndex": 7,
+            "ServerAddresses": [
+              "192.0.2.53"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "Id": "system.services",
+      "Name": "Services",
+      "Status": "Captured",
+      "Error": "",
+      "DurationMs": 1,
+      "IgnoreForComparison": [],
+      "Items": [
+        {
+          "Key": "[\"ExampleService\"]",
+          "Data": {
+            "Name": "ExampleService",
+            "State": "Running"
+          }
+        }
+      ]
+    },
+    {
+      "Id": "system.tasks",
+      "Name": "Scheduled tasks",
+      "Status": "Captured",
+      "Error": "",
+      "DurationMs": 10,
+      "IgnoreForComparison": [],
+      "Items": [
+        {
+          "Key": "[\"Example backup\"]",
+          "Data": {
+            "Enabled": true,
+            "State": "Ready",
+            "TaskName": "Example backup",
+            "TaskPath": "\\Lab\\"
+          }
+        }
+      ]
+    },
+    {
+      "Id": "system.software",
+      "Name": "Machine installed software",
+      "Status": "Captured",
+      "Error": "",
+      "DurationMs": 8,
+      "IgnoreForComparison": [],
+      "Items": [
+        {
+          "Key": "[\"Example application\"]",
+          "Data": {
+            "Name": "Example application",
+            "Publisher": "Example",
+            "Version": "1.2.3"
+          }
+        }
+      ]
+    }
+  ],
+  "Limitations": [
+    "Synthetic fixture. No live device data."
+  ]
+}
